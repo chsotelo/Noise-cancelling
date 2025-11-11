@@ -155,8 +155,6 @@ function App() {
 
   return (
     <div className="container">
-      <h1>Audio Test</h1>
-
       {errorMessage && <div className="toast error">{errorMessage}</div>}
       {toastMessage && <div className="toast info">{toastMessage}</div>}
 

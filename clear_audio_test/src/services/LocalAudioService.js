@@ -231,10 +231,10 @@ class LocalAudioService {
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         deviceId: deviceId === "default" ? undefined : { exact: deviceId },
-        channelCount: 1,
         echoCancellation: false,
         noiseSuppression: false,
         autoGainControl: false,
+        // No forzar channelCount, dejar que el navegador decida
       },
     });
   }
@@ -253,6 +253,14 @@ class LocalAudioService {
         }
 
         console.log("Reusing pre-initialized AudioContext");
+
+        // Asegurarse de que el worklet esté listo
+        // El worklet pre-inicializado ya debería estar listo, pero verificamos
+        if (!this.dtlnInitialized) {
+          console.warn("DTLN was not properly initialized");
+          // Forzar re-inicialización
+          throw new Error("DTLN not ready, forcing re-initialization");
+        }
       } else {
         // Crear nuevo contexto si no hay pre-inicialización
         this.audioContext = new (window.AudioContext ||

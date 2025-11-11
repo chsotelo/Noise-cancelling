@@ -7,6 +7,10 @@ class DtlnCaptureProcessor extends AudioWorkletProcessor {
   _buffer = new Float32Array(this._chunkSize);
   _bufferPosition = 0;
 
+  // Pre-emphasis muy suave solo para nitidez (no para filtrar)
+  _lastSample = 0;
+  _preEmphasis = 0.85; // Muy conservador
+
   constructor() {
     super();
   }
@@ -44,10 +48,22 @@ class DtlnCaptureProcessor extends AudioWorkletProcessor {
   }
 
   _processAndSend() {
-    // Convert Float32 to Int16 (PCM16)
+    // Convert Float32 to Int16 (PCM16) con un toque de nitidez
     const outputPcm16 = new Int16Array(this._chunkSize);
+
     for (let i = 0; i < this._chunkSize; i++) {
-      const s = Math.max(-1, Math.min(1, this._buffer[i]));
+      // Pre-emphasis muy suave (solo realza un poco las frecuencias altas)
+      const emphasized = this._buffer[i] - this._preEmphasis * this._lastSample;
+      this._lastSample = this._buffer[i];
+
+      // Mezcla muy conservadora: 90% original + 10% emphasized (solo un toque)
+      const enhanced = 0.9 * this._buffer[i] + 0.1 * emphasized;
+
+      // Boost de 1.4x
+      const boosted = enhanced * 1.4;
+
+      // Clamp y convertir a PCM16
+      const s = Math.max(-1, Math.min(1, boosted));
       outputPcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
 
