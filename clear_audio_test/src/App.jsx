@@ -5,6 +5,7 @@ import {
   AUDIO_CAPTURE_CONFIG,
 } from "./constants/audioConstants";
 import { encodeWAV } from "./services/wavEncoder";
+import { BrowserCapabilities } from "./utils/browserCapabilities";
 import "./App.css";
 
 function App() {
@@ -22,14 +23,20 @@ function App() {
   const mediaRecorderRef = useRef(null);
   const originalAudioChunksRef = useRef([]);
   const processedAudioChunksRef = useRef([]);
+  const isMountedRef = useRef(true);
+  const bestCodecRef = useRef(BrowserCapabilities.getBestAudioCodec());
 
   const handleAudioStateChange = useCallback((newState) => {
     setAppState(newState);
   }, []);
 
   useEffect(() => {
+    isMountedRef.current = true;
     localAudioService.init(handleAudioStateChange, { preInitializeDTLN: true });
-    return () => localAudioService.cleanup();
+    return () => {
+      isMountedRef.current = false;
+      localAudioService.cleanup();
+    };
   }, [handleAudioStateChange]);
 
   useEffect(() => {
@@ -39,28 +46,45 @@ function App() {
     };
   }, [originalAudioUrl, processedAudioUrl]);
 
-  const handleProcessedData = (pcm16DataBuffer) => {
+  const handleProcessedData = useCallback((pcm16DataBuffer) => {
+    if (!isMountedRef.current) return;
     const chunk = new Int16Array(pcm16DataBuffer);
     processedAudioChunksRef.current.push(chunk);
-  };
+  }, []);
+
+  const cleanupRecordings = useCallback(() => {
+    if (originalAudioUrl) {
+      URL.revokeObjectURL(originalAudioUrl);
+      setOriginalAudioUrl(null);
+    }
+    if (processedAudioUrl) {
+      URL.revokeObjectURL(processedAudioUrl);
+      setProcessedAudioUrl(null);
+    }
+    // Limpiar arrays de forma agresiva
+    originalAudioChunksRef.current.length = 0;
+    processedAudioChunksRef.current.length = 0;
+  }, [originalAudioUrl, processedAudioUrl]);
 
   const handleStartRecording = async () => {
     if (isRecording) return;
 
     // Limpiar grabaciones anteriores
-    if (originalAudioUrl) URL.revokeObjectURL(originalAudioUrl);
-    if (processedAudioUrl) URL.revokeObjectURL(processedAudioUrl);
-    setOriginalAudioUrl(null);
-    setProcessedAudioUrl(null);
-    originalAudioChunksRef.current = [];
-    processedAudioChunksRef.current = [];
+    cleanupRecordings();
 
     try {
       // Iniciar el servicio. Nos devuelve el stream original.
       const originalStream = await localAudioService.start(handleProcessedData);
 
       // --- Configurar MediaRecorder para el audio ORIGINAL ---
-      const recorder = new MediaRecorder(originalStream);
+      const codecToUse = bestCodecRef.current;
+      console.log(`Using audio codec: ${codecToUse}`);
+
+      const recorderOptions = {
+        mimeType: codecToUse,
+      };
+
+      const recorder = new MediaRecorder(originalStream, recorderOptions);
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (event) => {
@@ -70,15 +94,25 @@ function App() {
       };
 
       recorder.onstop = () => {
+        // Verificar que el componente siga montado
+        if (!isMountedRef.current) {
+          console.warn("Component unmounted, skipping audio generation");
+          return;
+        }
+
         console.log(
           `Total PCM16 chunks received: ${processedAudioChunksRef.current.length}`
         );
 
         // --- Generar audio ORIGINAL ---
-        const originalBlob = new Blob(originalAudioChunksRef.current, {
-          type: "audio/webm;codecs=opus", // Ajusta el tipo si es necesario
-        });
-        setOriginalAudioUrl(URL.createObjectURL(originalBlob));
+        if (originalAudioChunksRef.current.length > 0) {
+          const originalBlob = new Blob(originalAudioChunksRef.current, {
+            type: bestCodecRef.current,
+          });
+          setOriginalAudioUrl(URL.createObjectURL(originalBlob));
+        } else {
+          console.warn("No original audio chunks received!");
+        }
 
         // --- Generar audio PROCESADO ---
         if (processedAudioChunksRef.current.length > 0) {
@@ -94,6 +128,8 @@ function App() {
         }
       };
 
+      // Iniciar grabación sin timeslice para capturar todo hasta que se detenga manualmente
+      // Si necesitas chunks periódicos, usa recorder.start(1000) por ejemplo
       recorder.start();
       setIsRecording(true);
     } catch (error) {
@@ -102,13 +138,13 @@ function App() {
     }
   };
 
-  const handleStopRecording = () => {
+  const handleStopRecording = useCallback(() => {
     if (!isRecording) return;
+
     mediaRecorderRef.current?.stop();
     localAudioService.stop();
     setIsRecording(false);
-  };
-
+  }, [isRecording]);
   const handleDeviceChange = (e) => {
     localAudioService.setSelectedDevice(e.target.value);
   };

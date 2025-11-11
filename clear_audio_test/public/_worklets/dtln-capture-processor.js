@@ -51,7 +51,7 @@ class DtlnCaptureProcessor extends AudioWorkletProcessor {
       outputPcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
 
-    // Send the PCM16 buffer to the main thread
+    // Send the PCM16 buffer to the main thread using transferable for efficiency
     this.port.postMessage(outputPcm16.buffer, [outputPcm16.buffer]);
   }
 }

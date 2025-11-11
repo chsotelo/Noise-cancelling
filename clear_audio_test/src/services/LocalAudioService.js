@@ -37,6 +37,7 @@ class LocalAudioService {
 
   init(onStateChangeCallback = null, options = {}) {
     this.onStateChange = onStateChangeCallback || (() => {});
+
     navigator.mediaDevices.addEventListener(
       "devicechange",
       this.handleDeviceChange
@@ -44,6 +45,7 @@ class LocalAudioService {
     this.#setState(AudioServiceStatus.IDLE);
     this.#updateDevices().catch(() => {});
 
+    // Pre-inicializar DTLN si está habilitado
     if (options.preInitializeDTLN) {
       this.#preInitializeDTLN().catch((error) => {
         console.warn("DTLN pre-initialization failed:", error);
@@ -159,11 +161,22 @@ class LocalAudioService {
         sampleRate: 16000,
       });
 
+      // Verificar estado del contexto
+      if (tempContext.state === "suspended") {
+        await tempContext.resume();
+      }
+
       const workletURL = new URL(
         "/_worklets/dtln-audio-worklet.js",
         window.location.origin
       );
-      await tempContext.audioWorklet.addModule(workletURL.href);
+
+      try {
+        await tempContext.audioWorklet.addModule(workletURL.href);
+      } catch (moduleError) {
+        console.error("Failed to load DTLN worklet module:", moduleError);
+        throw new Error("DTLN module loading failed");
+      }
 
       const tempWorklet = new AudioWorkletNode(
         tempContext,
@@ -173,12 +186,21 @@ class LocalAudioService {
         }
       );
 
-      await new Promise((resolve) => {
+      // Esperar inicialización con timeout más robusto
+      const initPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error("DTLN pre-initialization timeout"));
+        }, 5000);
+
         tempWorklet.port.onmessage = (event) => {
-          if (event.data === "ready") resolve();
+          if (event.data === "ready") {
+            clearTimeout(timeout);
+            resolve();
+          }
         };
-        setTimeout(() => resolve(), 5000);
       });
+
+      await initPromise;
 
       const silent = tempContext.createBufferSource();
       silent.buffer = tempContext.createBuffer(1, 1, 16000);
@@ -189,8 +211,18 @@ class LocalAudioService {
       this.preInitContext = tempContext;
       this.preInitWorklet = tempWorklet;
       this.dtlnInitialized = true;
+      console.log("DTLN pre-initialization successful");
     } catch (error) {
       console.error("DTLN pre-initialization failed:", error);
+      // Limpiar recursos si falló
+      if (this.preInitContext) {
+        try {
+          this.preInitContext.close();
+        } catch {}
+        this.preInitContext = null;
+      }
+      this.preInitWorklet = null;
+      throw error;
     }
   }
 
@@ -209,51 +241,72 @@ class LocalAudioService {
 
   async #setupAudioProcessing() {
     try {
-      this.audioContext = new (window.AudioContext ||
-        window.webkitAudioContext)({
-        sampleRate: 16000,
-      });
-      if (this.audioContext.state === "suspended")
-        await this.audioContext.resume();
+      // Reutilizar el contexto pre-inicializado si está disponible
+      if (this.preInitContext && this.preInitContext.state !== "closed") {
+        this.audioContext = this.preInitContext;
+        this.workletNode = this.preInitWorklet;
+        this.preInitContext = null;
+        this.preInitWorklet = null;
 
-      const workletURL = new URL(
-        "/_worklets/dtln-audio-worklet.js",
-        window.location.origin
-      );
-      await this.audioContext.audioWorklet.addModule(workletURL.href);
-
-      this.workletNode = new AudioWorkletNode(
-        this.audioContext,
-        "NoiseSuppressionWorker",
-        {
-          processorOptions: { disableMetrics: true },
+        if (this.audioContext.state === "suspended") {
+          await this.audioContext.resume();
         }
-      );
 
-      // Wait for DTLN module to be ready with timeout
-      const dtlnReady = await Promise.race([
-        new Promise((resolve) => {
-          this.workletNode.port.onmessage = (event) => {
-            if (event.data === "ready") resolve(true);
-          };
-        }),
-        new Promise((_, reject) =>
-          setTimeout(
-            () => reject(new Error("DTLN initialization timeout")),
-            10000
-          )
-        ),
-      ]);
+        console.log("Reusing pre-initialized AudioContext");
+      } else {
+        // Crear nuevo contexto si no hay pre-inicialización
+        this.audioContext = new (window.AudioContext ||
+          window.webkitAudioContext)({
+          sampleRate: 16000,
+        });
+        if (this.audioContext.state === "suspended")
+          await this.audioContext.resume();
 
-      if (!dtlnReady) {
-        throw new Error("DTLN module failed to initialize");
+        const workletURL = new URL(
+          "/_worklets/dtln-audio-worklet.js",
+          window.location.origin
+        );
+        await this.audioContext.audioWorklet.addModule(workletURL.href);
+
+        this.workletNode = new AudioWorkletNode(
+          this.audioContext,
+          "NoiseSuppressionWorker",
+          {
+            processorOptions: { disableMetrics: true },
+          }
+        );
+
+        // Wait for DTLN module to be ready with timeout
+        const dtlnReady = await Promise.race([
+          new Promise((resolve) => {
+            this.workletNode.port.onmessage = (event) => {
+              if (event.data === "ready") resolve(true);
+            };
+          }),
+          new Promise((_, reject) =>
+            setTimeout(
+              () => reject(new Error("DTLN initialization timeout")),
+              10000
+            )
+          ),
+        ]);
+
+        if (!dtlnReady) {
+          throw new Error("DTLN module failed to initialize");
+        }
       }
 
       const captureWorkletURL = new URL(
         "/_worklets/dtln-capture-processor.js",
         window.location.origin
       );
-      await this.audioContext.audioWorklet.addModule(captureWorkletURL.href);
+
+      try {
+        await this.audioContext.audioWorklet.addModule(captureWorkletURL.href);
+      } catch (moduleError) {
+        console.error("Failed to load capture worklet module:", moduleError);
+        throw new Error("Capture processor module loading failed");
+      }
 
       this.captureWorklet = new AudioWorkletNode(
         this.audioContext,
@@ -264,8 +317,14 @@ class LocalAudioService {
         this.stream
       );
 
-      this.microphoneSource.connect(this.workletNode);
-      this.workletNode.connect(this.captureWorklet);
+      // Conectar nodos de audio
+      try {
+        this.microphoneSource.connect(this.workletNode);
+        this.workletNode.connect(this.captureWorklet);
+      } catch (connectionError) {
+        console.error("Failed to connect audio nodes:", connectionError);
+        throw new Error("Audio processing pipeline connection failed");
+      }
 
       this.captureWorklet.port.onmessage = (event) => {
         if (this.#status !== AudioServiceStatus.CAPTURING) return;
@@ -361,6 +420,7 @@ class LocalAudioService {
       this.microphoneSource.disconnect();
       this.microphoneSource = null;
     }
+    // Solo cerrar si no estamos reutilizando el contexto
     if (this.audioContext && this.audioContext.state !== "closed") {
       this.audioContext.close();
     }
