@@ -2,14 +2,25 @@
 // Input: Denoised audio at 16kHz from DTLN (comes through the 'input' parameter)
 // Output: PCM16 ArrayBuffer chunks sent via port.postMessage
 
+/**
+ * ⚙️ CONFIGURACIÓN DE PROCESAMIENTO
+ * Para ajustar estos valores, ver: src/constants/audioProcessingConfig.js
+ */
+const CONFIG = {
+  CHUNK_SIZE: 1024, // Tamaño del buffer (samples)
+  PRE_EMPHASIS: 0.85, // Realce de frecuencias altas (0.0-0.97)
+  VOLUME_BOOST: 1.4, // Amplificación de volumen (1.0-2.0)
+  MIX_ORIGINAL_RATIO: 0.9, // % señal original (resto es procesado)
+};
+
 class DtlnCaptureProcessor extends AudioWorkletProcessor {
-  _chunkSize = 1024; // 1024 samples at 16kHz = 64ms of audio
+  _chunkSize = CONFIG.CHUNK_SIZE;
   _buffer = new Float32Array(this._chunkSize);
   _bufferPosition = 0;
 
-  // Pre-emphasis muy suave solo para nitidez (no para filtrar)
+  // Pre-emphasis para nitidez de voz
   _lastSample = 0;
-  _preEmphasis = 0.85; // Muy conservador
+  _preEmphasis = CONFIG.PRE_EMPHASIS;
 
   constructor() {
     super();
@@ -48,19 +59,21 @@ class DtlnCaptureProcessor extends AudioWorkletProcessor {
   }
 
   _processAndSend() {
-    // Convert Float32 to Int16 (PCM16) con un toque de nitidez
+    // Convert Float32 to Int16 (PCM16) con nitidez configurable
     const outputPcm16 = new Int16Array(this._chunkSize);
 
     for (let i = 0; i < this._chunkSize; i++) {
-      // Pre-emphasis muy suave (solo realza un poco las frecuencias altas)
+      // Pre-emphasis (realza frecuencias altas para nitidez)
       const emphasized = this._buffer[i] - this._preEmphasis * this._lastSample;
       this._lastSample = this._buffer[i];
 
-      // Mezcla muy conservadora: 90% original + 10% emphasized (solo un toque)
-      const enhanced = 0.9 * this._buffer[i] + 0.1 * emphasized;
+      // Mezcla configurable: original + procesado
+      const mixProcessed = 1.0 - CONFIG.MIX_ORIGINAL_RATIO;
+      const enhanced =
+        CONFIG.MIX_ORIGINAL_RATIO * this._buffer[i] + mixProcessed * emphasized;
 
-      // Boost de 1.4x
-      const boosted = enhanced * 1.4;
+      // Boost de volumen
+      const boosted = enhanced * CONFIG.VOLUME_BOOST;
 
       // Clamp y convertir a PCM16
       const s = Math.max(-1, Math.min(1, boosted));
