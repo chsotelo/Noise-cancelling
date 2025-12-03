@@ -30,19 +30,11 @@ jobs:
 
       - name: Install dependencies
         working-directory: ./clear_audio_test
-        run: |
-          echo "Current directory: $(pwd)"
-          echo "Files in directory:"
-          ls -la
-          npm ci
+        run: npm install
 
       - name: Build
         working-directory: ./clear_audio_test
-        run: |
-          echo "Running build..."
-          npm run build
-          echo "Build completed. Checking dist folder:"
-          ls -la dist/
+        run: npm run build
 
       - name: Setup Pages
         uses: actions/configure-pages@v4
