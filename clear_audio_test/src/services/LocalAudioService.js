@@ -167,7 +167,7 @@ class LocalAudioService {
       }
 
       const workletURL = new URL(
-        "/_worklets/dtln-audio-worklet.js",
+        `${import.meta.env.BASE_URL}_worklets/dtln-audio-worklet.js`,
         window.location.origin
       );
 
@@ -271,7 +271,7 @@ class LocalAudioService {
           await this.audioContext.resume();
 
         const workletURL = new URL(
-          "/_worklets/dtln-audio-worklet.js",
+          `${import.meta.env.BASE_URL}_worklets/dtln-audio-worklet.js`,
           window.location.origin
         );
         await this.audioContext.audioWorklet.addModule(workletURL.href);
@@ -305,7 +305,7 @@ class LocalAudioService {
       }
 
       const captureWorkletURL = new URL(
-        "/_worklets/dtln-capture-processor.js",
+        `${import.meta.env.BASE_URL}_worklets/dtln-capture-processor.js`,
         window.location.origin
       );
 
