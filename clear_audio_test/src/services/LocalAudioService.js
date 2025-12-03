@@ -203,7 +203,11 @@ class LocalAudioService {
       await initPromise;
 
       const silent = tempContext.createBufferSource();
-      silent.buffer = tempContext.createBuffer(1, 1, AUDIO_CAPTURE_CONFIG.TRANSMISSION_SAMPLE_RATE);
+      silent.buffer = tempContext.createBuffer(
+        1,
+        1,
+        AUDIO_CAPTURE_CONFIG.TRANSMISSION_SAMPLE_RATE
+      );
       silent.loop = true;
       silent.connect(tempWorklet);
       silent.start();
