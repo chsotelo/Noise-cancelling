@@ -158,7 +158,7 @@ class LocalAudioService {
     try {
       const tempContext = new (window.AudioContext ||
         window.webkitAudioContext)({
-        sampleRate: 16000,
+        sampleRate: AUDIO_CAPTURE_CONFIG.TRANSMISSION_SAMPLE_RATE,
       });
 
       // Verificar estado del contexto
@@ -203,7 +203,7 @@ class LocalAudioService {
       await initPromise;
 
       const silent = tempContext.createBufferSource();
-      silent.buffer = tempContext.createBuffer(1, 1, 16000);
+      silent.buffer = tempContext.createBuffer(1, 1, AUDIO_CAPTURE_CONFIG.TRANSMISSION_SAMPLE_RATE);
       silent.loop = true;
       silent.connect(tempWorklet);
       silent.start();
@@ -265,7 +265,7 @@ class LocalAudioService {
         // Crear nuevo contexto si no hay pre-inicialización
         this.audioContext = new (window.AudioContext ||
           window.webkitAudioContext)({
-          sampleRate: 16000,
+          sampleRate: AUDIO_CAPTURE_CONFIG.TRANSMISSION_SAMPLE_RATE,
         });
         if (this.audioContext.state === "suspended")
           await this.audioContext.resume();
