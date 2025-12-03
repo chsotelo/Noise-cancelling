@@ -340,6 +340,8 @@ class LocalAudioService {
         const pcm16DataBuffer = event.data;
         if (!pcm16DataBuffer || pcm16DataBuffer.byteLength === 0) return;
 
+        console.log({ data: pcm16DataBuffer });
+
         if (this.onProcessedDataCallback) {
           this.onProcessedDataCallback(pcm16DataBuffer);
         }
