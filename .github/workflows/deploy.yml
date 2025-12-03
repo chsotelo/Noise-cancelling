@@ -6,7 +6,7 @@ on:
       - main
       - master
     paths:
-      - 'clear_audio_test/**'
+      - "clear_audio_test/**"
   workflow_dispatch:
 
 permissions:
@@ -31,9 +31,9 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: './clear_audio_test/package-lock.json'
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: "./clear_audio_test/package-lock.json"
 
       - name: Install dependencies
         run: npm ci
@@ -47,7 +47,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './clear_audio_test/dist'
+          path: "./clear_audio_test/dist"
 
   deploy:
     environment:
