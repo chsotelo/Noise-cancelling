@@ -109,13 +109,37 @@ select {
   border: 1px solid #555;
   width: 100%;
   max-width: 100%;
+  margin-bottom: 12px;
 }
 
 label {
   display: block;
   margin-bottom: 6px;
+  margin-top: 8px;
   font-size: 14px;
   color: #aaa;
+}
+
+label:first-of-type {
+  margin-top: 0;
+}
+
+.mode-indicator {
+  margin-top: 12px;
+  padding: 10px;
+  background-color: #1a3a1a;
+  border-left: 3px solid #61dafb;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.mode-indicator strong {
+  color: #61dafb;
+}
+
+.mode-indicator small {
+  color: #aaa;
+  font-size: 11px;
 }
 
 /* Mobile optimization */

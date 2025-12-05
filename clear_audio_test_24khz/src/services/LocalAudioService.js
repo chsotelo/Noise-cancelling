@@ -1,7 +1,10 @@
 import {
   AUDIO_CAPTURE_CONFIG,
+  AUDIO_MODES,
   AudioServiceStatus,
 } from "../constants/audioConstants";
+import { DeviceCapabilityDetector } from "../utils/deviceCapabilityDetector";
+import { WasmLoader } from "../utils/wasmLoader";
 
 class LocalAudioService {
   static instance;
@@ -11,6 +14,11 @@ class LocalAudioService {
   #toastMessage = null;
   #devices = [];
   #selectedDeviceId = "default";
+
+  // Estado del modo de procesamiento
+  currentMode = null;
+  currentModeConfig = null;
+  runtimeMonitorId = null;
 
   onProcessedDataCallback = null;
   audioContext = null;
@@ -46,7 +54,7 @@ class LocalAudioService {
     this.#updateDevices().catch(() => {});
   }
 
-  async start(onProcessedData) {
+  async start(onProcessedData, forcedMode = null) {
     if (
       this.#status === AudioServiceStatus.CAPTURING ||
       this.#status === AudioServiceStatus.INITIALIZING
@@ -56,18 +64,18 @@ class LocalAudioService {
     this.#setState(AudioServiceStatus.INITIALIZING);
     this.onProcessedDataCallback = onProcessedData;
 
-    // Pre-inicializar DTLN aquí (después del gesto del usuario)
-    if (!this.dtlnInitialized) {
-      try {
-        await this.#preInitializeDTLN();
-      } catch (error) {
-        console.warn(
-          "DTLN pre-initialization failed, will initialize on demand:",
-          error
-        );
-        // No es crítico, continuamos sin pre-inicialización
-      }
-    }
+    // PASO 1: Detectar modo óptimo (PREMIUM o LIGHT)
+    const detectedMode =
+      forcedMode || (await DeviceCapabilityDetector.detectOptimalMode());
+    this.currentMode = detectedMode;
+    this.currentModeConfig = AUDIO_MODES[detectedMode];
+
+    console.log(
+      `🚀 Starting audio service in ${detectedMode} mode`,
+      this.currentModeConfig
+    );
+
+    this.#setToast(`Audio Mode: ${this.currentModeConfig.name}`);
 
     try {
       await this.#updateDevices();
@@ -162,10 +170,12 @@ class LocalAudioService {
     if (this.dtlnInitialized) return;
 
     try {
-      // AudioContext a 16kHz para DTLN (el modelo está entrenado para esta tasa)
+      // AudioContext a la tasa del modo actual
+      const sampleRate = this.currentModeConfig.PROCESSING_SAMPLE_RATE;
+
       const tempContext = new (window.AudioContext ||
         window.webkitAudioContext)({
-        sampleRate: AUDIO_CAPTURE_CONFIG.AI_PROCESSING_RATE,
+        sampleRate: sampleRate,
       });
 
       // Verificar estado del contexto
@@ -173,25 +183,51 @@ class LocalAudioService {
         await tempContext.resume();
       }
 
+      // Seleccionar el worklet según el modo
+      const workletPath = this.getWorkletPath(this.currentMode);
       const workletURL = new URL(
-        `${import.meta.env.BASE_URL}_worklets/dtln-audio-worklet.js`,
+        `${import.meta.env.BASE_URL}${workletPath}`,
         window.location.origin
       );
 
       try {
         await tempContext.audioWorklet.addModule(workletURL.href);
       } catch (moduleError) {
-        console.error("Failed to load DTLN worklet module:", moduleError);
-        throw new Error("DTLN module loading failed");
+        console.error(
+          `Failed to load ${this.currentMode} worklet module:`,
+          moduleError
+        );
+        throw new Error(`${this.currentMode} module loading failed`);
       }
 
-      const tempWorklet = new AudioWorkletNode(
-        tempContext,
-        "NoiseSuppressionWorker",
-        {
-          processorOptions: { disableMetrics: true },
-        }
-      );
+      // Load WASM for pre-initialization
+      console.log(`📦 Pre-loading WASM for ${this.currentMode} mode...`);
+      let wasmBytes, modelBytes;
+
+      if (this.currentMode === "PREMIUM") {
+        [wasmBytes, modelBytes] = await Promise.all([
+          WasmLoader.loadDeepFilterNetWasm(),
+          WasmLoader.loadDeepFilterNetModel(),
+        ]);
+        console.log(
+          `✓ Pre-loaded DeepFilterNet WASM (${wasmBytes.byteLength} bytes) and model (${modelBytes.byteLength} bytes)`
+        );
+      } else {
+        wasmBytes = await WasmLoader.loadRNNoiseWasm();
+        console.log(
+          `✓ Pre-loaded RNNoise WASM (${wasmBytes.byteLength} bytes)`
+        );
+      }
+
+      const processorName = this.getProcessorName(this.currentMode);
+      const tempWorklet = new AudioWorkletNode(tempContext, processorName, {
+        processorOptions: {
+          disableMetrics: true,
+          mode: this.currentMode,
+          wasmBytes,
+          modelBytes,
+        },
+      });
 
       // Esperar inicialización con timeout más robusto
       const initPromise = new Promise((resolve, reject) => {
@@ -213,7 +249,7 @@ class LocalAudioService {
       silent.buffer = tempContext.createBuffer(
         1,
         1,
-        AUDIO_CAPTURE_CONFIG.AI_PROCESSING_RATE
+        this.currentModeConfig.PROCESSING_SAMPLE_RATE
       );
       silent.loop = true;
       silent.connect(tempWorklet);
@@ -222,9 +258,11 @@ class LocalAudioService {
       this.preInitContext = tempContext;
       this.preInitWorklet = tempWorklet;
       this.dtlnInitialized = true;
-      console.log("DTLN pre-initialization successful");
+      console.log(
+        `${this.currentMode} model pre-initialization successful @ ${this.currentModeConfig.PROCESSING_SAMPLE_RATE}Hz`
+      );
     } catch (error) {
-      console.error("DTLN pre-initialization failed:", error);
+      console.error("Model pre-initialization failed:", error);
       // Limpiar recursos si falló
       if (this.preInitContext) {
         try {
@@ -252,6 +290,12 @@ class LocalAudioService {
 
   async #setupAudioProcessing() {
     try {
+      const processingRate = this.currentModeConfig.PROCESSING_SAMPLE_RATE;
+
+      console.log(
+        `⚙️ Setting up audio processing @ ${processingRate}Hz (${this.currentMode} mode)`
+      );
+
       // Reutilizar el contexto pre-inicializado si está disponible
       if (this.preInitContext && this.preInitContext.state !== "closed") {
         this.audioContext = this.preInitContext;
@@ -263,40 +307,66 @@ class LocalAudioService {
           await this.audioContext.resume();
         }
 
-        console.log("Reusing pre-initialized AudioContext");
+        console.log("✓ Reusing pre-initialized AudioContext");
 
         // Asegurarse de que el worklet esté listo
-        // El worklet pre-inicializado ya debería estar listo, pero verificamos
         if (!this.dtlnInitialized) {
-          console.warn("DTLN was not properly initialized");
-          // Forzar re-inicialización
-          throw new Error("DTLN not ready, forcing re-initialization");
+          console.warn("Model was not properly initialized");
+          throw new Error("Model not ready, forcing re-initialization");
         }
       } else {
-        // Crear nuevo contexto a 16kHz para DTLN (requisito del modelo)
+        // Crear nuevo contexto a la tasa del modo actual
         this.audioContext = new (window.AudioContext ||
           window.webkitAudioContext)({
-          sampleRate: AUDIO_CAPTURE_CONFIG.AI_PROCESSING_RATE,
+          sampleRate: processingRate,
         });
-        if (this.audioContext.state === "suspended")
-          await this.audioContext.resume();
 
+        if (this.audioContext.state === "suspended") {
+          await this.audioContext.resume();
+        }
+
+        const workletPath = this.getWorkletPath(this.currentMode);
         const workletURL = new URL(
-          `${import.meta.env.BASE_URL}_worklets/dtln-audio-worklet.js`,
+          `${import.meta.env.BASE_URL}${workletPath}`,
           window.location.origin
         );
         await this.audioContext.audioWorklet.addModule(workletURL.href);
 
+        // Load WASM files based on current mode
+        console.log(`📦 Loading WASM for ${this.currentMode} mode...`);
+        let wasmBytes, modelBytes;
+
+        if (this.currentMode === "PREMIUM") {
+          // DeepFilterNet requires both WASM binary and model
+          [wasmBytes, modelBytes] = await Promise.all([
+            WasmLoader.loadDeepFilterNetWasm(),
+            WasmLoader.loadDeepFilterNetModel(),
+          ]);
+          console.log(
+            `✓ Loaded DeepFilterNet WASM (${wasmBytes.byteLength} bytes) and model (${modelBytes.byteLength} bytes)`
+          );
+        } else {
+          // RNNoise only needs WASM binary
+          wasmBytes = await WasmLoader.loadRNNoiseWasm();
+          console.log(`✓ Loaded RNNoise WASM (${wasmBytes.byteLength} bytes)`);
+        }
+
+        const processorName = this.getProcessorName(this.currentMode);
         this.workletNode = new AudioWorkletNode(
           this.audioContext,
-          "NoiseSuppressionWorker",
+          processorName,
           {
-            processorOptions: { disableMetrics: true },
+            processorOptions: {
+              disableMetrics: true,
+              mode: this.currentMode,
+              wasmBytes,
+              modelBytes,
+            },
           }
         );
 
-        // Wait for DTLN module to be ready with timeout
-        const dtlnReady = await Promise.race([
+        // Wait for model to be ready with timeout
+        const modelReady = await Promise.race([
           new Promise((resolve) => {
             this.workletNode.port.onmessage = (event) => {
               if (event.data === "ready") resolve(true);
@@ -304,60 +374,62 @@ class LocalAudioService {
           }),
           new Promise((_, reject) =>
             setTimeout(
-              () => reject(new Error("DTLN initialization timeout")),
+              () =>
+                reject(
+                  new Error(`${this.currentMode} model initialization timeout`)
+                ),
               10000
             )
           ),
         ]);
 
-        if (!dtlnReady) {
-          throw new Error("DTLN module failed to initialize");
+        if (!modelReady) {
+          throw new Error(`${this.currentMode} model failed to initialize`);
         }
+
+        console.log(`✓ ${this.currentMode} model initialized successfully`);
       }
-
-      const captureWorkletURL = new URL(
-        `${import.meta.env.BASE_URL}_worklets/dtln-capture-processor.js`,
-        window.location.origin
-      );
-
-      try {
-        await this.audioContext.audioWorklet.addModule(captureWorkletURL.href);
-      } catch (moduleError) {
-        console.error("Failed to load capture worklet module:", moduleError);
-        throw new Error("Capture processor module loading failed");
-      }
-
-      this.captureWorklet = new AudioWorkletNode(
-        this.audioContext,
-        "dtln-capture-processor"
-      );
 
       this.microphoneSource = this.audioContext.createMediaStreamSource(
         this.stream
       );
 
-      // Conectar nodos de audio:
-      // Micrófono → AudioContext (resampling automático a 16kHz) → DTLN AI (16kHz) → Capture Processor
+      // Conectar micrófono directamente al worklet de procesamiento
+      // Micrófono → Worklet (RNNoise/DeepFilterNet) @ 24kHz/48kHz
       try {
         this.microphoneSource.connect(this.workletNode);
-        this.workletNode.connect(this.captureWorklet);
+        // No conectar a destination - solo procesamos, no reproducimos
       } catch (connectionError) {
         console.error("Failed to connect audio nodes:", connectionError);
         throw new Error("Audio processing pipeline connection failed");
       }
 
-      this.captureWorklet.port.onmessage = (event) => {
+      // Recibir audio procesado directamente del worklet
+      this.workletNode.port.onmessage = (event) => {
         if (this.#status !== AudioServiceStatus.CAPTURING) return;
 
-        const pcm16DataBuffer = event.data;
-        if (!pcm16DataBuffer || pcm16DataBuffer.byteLength === 0) return;
+        const message = event.data;
 
-        console.log({ data: pcm16DataBuffer });
+        // Handle different message types
+        if (message.type === "pcm16") {
+          const pcm16DataBuffer = message.data;
+          if (!pcm16DataBuffer || pcm16DataBuffer.byteLength === 0) return;
 
-        if (this.onProcessedDataCallback) {
-          this.onProcessedDataCallback(pcm16DataBuffer);
+          // El output SIEMPRE es @ 24kHz (requisito obligatorio)
+          // En PREMIUM: el worklet hace 48k→24k internamente
+          // En LIGHT: el worklet procesa directo @ 24k
+
+          if (this.onProcessedDataCallback) {
+            this.onProcessedDataCallback(pcm16DataBuffer);
+          }
         }
       };
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // PASO FINAL: Iniciar monitoreo de rendimiento
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+      this.#startRuntimeMonitoring();
     } catch (error) {
       console.error("Audio processing setup failed:", error);
       this.#status = AudioServiceStatus.ERROR;
@@ -366,6 +438,27 @@ class LocalAudioService {
       this.#notifyState();
       throw error;
     }
+  }
+
+  #startRuntimeMonitoring() {
+    // Cancelar monitoreo previo si existe
+    if (this.runtimeMonitorId) {
+      clearInterval(this.runtimeMonitorId);
+    }
+
+    this.runtimeMonitorId = DeviceCapabilityDetector.monitorRuntime(
+      (action) => {
+        if (action === "DOWNGRADE" && this.currentMode === "PREMIUM") {
+          console.warn("⚠️ CPU overload detected, switching to LIGHT mode");
+          this.#setToast("Switching to Light mode due to high CPU usage");
+          // TODO: Implementar hot-swap de modo sin reiniciar
+          // Por ahora solo alertamos
+        } else if (action === "UPGRADE" && this.currentMode === "LIGHT") {
+          console.log("✅ CPU available, can upgrade to PREMIUM mode");
+          this.#setToast("Device can handle Premium mode");
+        }
+      }
+    );
   }
 
   #handleStreamError(error) {
@@ -453,6 +546,12 @@ class LocalAudioService {
   cleanup() {
     this.stop();
 
+    // Detener monitoreo de rendimiento
+    if (this.runtimeMonitorId) {
+      clearInterval(this.runtimeMonitorId);
+      this.runtimeMonitorId = null;
+    }
+
     if (this.preInitWorklet) {
       this.preInitWorklet.disconnect();
       this.preInitWorklet = null;
@@ -467,6 +566,40 @@ class LocalAudioService {
       "devicechange",
       this.handleDeviceChange
     );
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // API Pública adicional
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  getCurrentMode() {
+    return this.currentMode;
+  }
+
+  getCurrentModeConfig() {
+    return this.currentModeConfig;
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // Helpers para selección de worklets
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  getWorkletPath(mode) {
+    const workletMap = {
+      LIGHT: "_worklets/rnnoise-worklet.js", // O dtln-audio-worklet.js
+      PREMIUM: "_worklets/deepfilter-worklet.js", // DeepFilterNet WASM
+    };
+
+    return workletMap[mode] || workletMap.LIGHT;
+  }
+
+  getProcessorName(mode) {
+    const processorMap = {
+      LIGHT: "rnnoise-processor", // RNNoise processor
+      PREMIUM: "deepfilter-processor", // DeepFilterNet processor
+    };
+
+    return processorMap[mode] || processorMap.LIGHT;
   }
 }
 
