@@ -1,0 +1,215 @@
+name: Deploy Both Audio Tests to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Build 16kHz project
+      - name: Install dependencies (16kHz)
+        working-directory: ./clear_audio_test_16khz
+        run: npm install
+
+      - name: Build (16kHz)
+        working-directory: ./clear_audio_test_16khz
+        run: npm run build
+
+      # Build 24kHz project
+      - name: Install dependencies (24kHz)
+        working-directory: ./clear_audio_test_24khz
+        run: npm install
+
+      - name: Build worklets (24kHz)
+        working-directory: ./clear_audio_test_24khz
+        run: npm run build:worklet
+
+      - name: Build (24kHz)
+        working-directory: ./clear_audio_test_24khz
+        run: npm run build
+
+      # Combine both builds into final structure
+      - name: Create combined dist folder
+        run: |
+          mkdir -p ./final_dist/16khz
+          mkdir -p ./final_dist/24khz
+          cp -r ./clear_audio_test_16khz/dist/* ./final_dist/16khz/
+          cp -r ./clear_audio_test_24khz/dist/* ./final_dist/24khz/
+
+      # Create index.html to choose between versions
+      - name: Create main index.html
+        run: |
+          cat > ./final_dist/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="es">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Noise Cancelling Audio Tests</title>
+            <style>
+              * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+              }
+              body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+              }
+              .container {
+                background: white;
+                border-radius: 20px;
+                padding: 60px 40px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                max-width: 700px;
+                width: 100%;
+              }
+              h1 {
+                color: #333;
+                margin-bottom: 15px;
+                font-size: 2.5em;
+                text-align: center;
+              }
+              .subtitle {
+                color: #666;
+                text-align: center;
+                margin-bottom: 50px;
+                font-size: 1.1em;
+              }
+              .options {
+                display: grid;
+                gap: 25px;
+              }
+              .option-card {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                border-radius: 15px;
+                padding: 30px;
+                text-decoration: none;
+                color: white;
+                transition: transform 0.3s, box-shadow 0.3s;
+                cursor: pointer;
+              }
+              .option-card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 15px 40px rgba(102, 126, 234, 0.4);
+              }
+              .option-title {
+                font-size: 1.8em;
+                font-weight: bold;
+                margin-bottom: 10px;
+              }
+              .option-subtitle {
+                font-size: 1em;
+                opacity: 0.95;
+                margin-bottom: 15px;
+              }
+              .option-features {
+                list-style: none;
+                font-size: 0.95em;
+                opacity: 0.9;
+              }
+              .option-features li {
+                margin: 8px 0;
+                padding-left: 20px;
+                position: relative;
+              }
+              .option-features li:before {
+                content: "✓";
+                position: absolute;
+                left: 0;
+                font-weight: bold;
+              }
+              .premium {
+                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+              }
+              @media (max-width: 600px) {
+                .container {
+                  padding: 40px 25px;
+                }
+                h1 {
+                  font-size: 2em;
+                }
+                .option-title {
+                  font-size: 1.5em;
+                }
+              }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <h1>🎙️ Noise Cancelling</h1>
+              <p class="subtitle">Elige la versión de procesamiento de audio</p>
+              
+              <div class="options">
+                <a href="./16khz/" class="option-card">
+                  <div class="option-title">💡 Light Mode</div>
+                  <div class="option-subtitle">RNNoise @ 16kHz</div>
+                  <ul class="option-features">
+                    <li>Procesamiento rápido y eficiente</li>
+                    <li>Ideal para dispositivos de gama media-baja</li>
+                    <li>Supresión de ruido estacionario</li>
+                    <li>Menor consumo de recursos</li>
+                  </ul>
+                </a>
+
+                <a href="./24khz/" class="option-card premium">
+                  <div class="option-title">⚡ Premium Mode</div>
+                  <div class="option-subtitle">DeepFilterNet @ 48kHz → 24kHz</div>
+                  <ul class="option-features">
+                    <li>Máxima calidad de audio (24kHz)</li>
+                    <li>IA de última generación (SOTA)</li>
+                    <li>Supresión de ruido no estacionario</li>
+                    <li>Ideal para dispositivos potentes</li>
+                  </ul>
+                </a>
+              </div>
+            </div>
+          </body>
+          </html>
+          EOF
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "./final_dist"
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
