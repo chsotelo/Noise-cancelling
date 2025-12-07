@@ -4,6 +4,9 @@
 // Import the Emscripten-generated module
 import createRNNWasmModule from "../../public/_worklets/rnnoise.js";
 
+// Import audio dynamic processor for consistent quality
+import { AudioDynamicProcessor } from "../../src/utils/audioResampler.js";
+
 // RNNoise configuration
 const RNNOISE_CONFIG = {
   SAMPLE_RATE: 24000,
@@ -27,9 +30,16 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
     this.outputBuffer = new Float32Array(RNNOISE_CONFIG.FRAME_SIZE);
     this.bufferPos = 0;
 
+    // CRITICAL: Pre-initialization buffer to store audio BEFORE model is ready
+    this.preInitBuffer = [];
+    this.MAX_PREINIT_BUFFER = 24000 * 2; // 2 seconds max @ 24kHz
+
     // Accumulation buffer for sending larger chunks (reduce fragmentation)
     this.accumulatedOutput = [];
-    this.MIN_SEND_SIZE = 2400; // 100ms @ 24kHz
+    this.MIN_SEND_SIZE = 480; // 20ms @ 24kHz (reduced from 100ms for lower latency)
+
+    // Dynamic audio processor (adaptive gain + soft limiter)
+    this.dynamicProcessor = new AudioDynamicProcessor();
 
     // WASM heap buffers
     this.heapInputBuffer = null;
@@ -39,6 +49,12 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
     this.outputReadPos = 0;
     this.outputWritePos = 0;
 
+    // Frame counter for metrics
+    this.frameCount = 0;
+
+    // CRITICAL: Control flag - only process audio when recording is active
+    this.isRecordingActive = false;
+
     // Get WASM bytes from processor options
     this.wasmBytes = options?.processorOptions?.wasmBytes;
 
@@ -47,6 +63,19 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
       "[RNNoise LIGHT] WASM bytes received:",
       this.wasmBytes ? "YES" : "NO"
     );
+
+    // Listen for commands from main thread
+    this.port.onmessage = (event) => {
+      if (event.data === "start") {
+        console.log("[RNNoise LIGHT] Recording started");
+        this.isRecordingActive = true;
+      } else if (event.data === "stop") {
+        console.log("[RNNoise LIGHT] Recording stopped");
+        this.isRecordingActive = false;
+      } else if (event.data === "flush") {
+        this.flushBuffers();
+      }
+    };
 
     // Inicializar RNNoise
     this.initRNNoise();
@@ -147,14 +176,6 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs, outputs) {
-    if (!this.initialized) {
-      // Mientras se inicializa, pass-through
-      if (inputs[0] && outputs[0] && inputs[0][0] && outputs[0][0]) {
-        outputs[0][0].set(inputs[0][0]);
-      }
-      return true;
-    }
-
     const input = inputs[0];
     const output = outputs[0];
 
@@ -164,6 +185,16 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
 
     const inputChannel = input[0];
     const outputChannel = output[0];
+
+    // CRITICAL: Only process audio when recording is active
+    if (!this.isRecordingActive) {
+      return true;
+    }
+
+    // Wait until initialized
+    if (!this.initialized) {
+      return true;
+    }
     const blockSize = inputChannel.length;
 
     // Output buffer tracking
@@ -197,13 +228,36 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
       outputReadPos = 0;
     }
 
-    // Send accumulated frames when we have enough data (100ms chunks)
+    // Send accumulated frames when we have enough data (20ms chunks - reduced latency)
     if (this.accumulatedOutput.length >= this.MIN_SEND_SIZE) {
+      // Convert accumulated output to Float32Array for processing
+      const audioBuffer = new Float32Array(this.accumulatedOutput);
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // Apply adaptive gain normalization + soft limiting
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const { processed, gainApplied, rms, peak, saturated } =
+        this.dynamicProcessor.process(audioBuffer);
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       // Convert Float32 [-1, 1] to PCM16 [-32768, 32767]
-      const pcm16 = new Int16Array(this.accumulatedOutput.length);
-      for (let i = 0; i < this.accumulatedOutput.length; i++) {
-        const sample = Math.max(-1, Math.min(1, this.accumulatedOutput[i]));
-        pcm16[i] = sample < 0 ? sample * 32768 : sample * 32767;
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const pcm16 = new Int16Array(processed.length);
+      for (let i = 0; i < processed.length; i++) {
+        const pcmValue = processed[i] * 32768;
+        pcm16[i] = Math.max(-32768, Math.min(32767, Math.round(pcmValue)));
+      }
+
+      // Log with audio metrics (throttled to avoid spam)
+      this.frameCount++;
+      if (this.frameCount % 50 === 0) {
+        const satIcon = saturated ? "🔴" : "🟢";
+        console.log(
+          `[RNNoise] ${satIcon} PCM16: ${pcm16.length} samples @ 24kHz | ` +
+            `Gain: ${gainApplied.toFixed(2)}x | RMS: ${(rms * 100).toFixed(
+              1
+            )}% | Peak: ${(peak * 100).toFixed(1)}%`
+        );
       }
 
       this.port.postMessage(
@@ -259,6 +313,69 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
       // En caso de error, pasar audio sin procesar
       this.outputBuffer.set(this.inputBuffer);
     }
+  }
+
+  flushBuffers() {
+    console.log("[RNNoise LIGHT] Flushing remaining buffers before stop...");
+
+    if (!this.initialized) {
+      console.log("[RNNoise LIGHT] Not initialized, nothing to flush");
+      return;
+    }
+
+    // Process remaining samples in inputBuffer
+    // Only process if we have a complete frame, otherwise discard to avoid artificial silence
+    if (this.bufferPos >= RNNOISE_CONFIG.FRAME_SIZE) {
+      console.log(
+        `[RNNoise LIGHT] Flushing complete frame: ${this.bufferPos} samples`
+      );
+
+      // Process final frame
+      this.processFrame();
+
+      // Add to accumulated output
+      for (let i = 0; i < this.outputBuffer.length; i++) {
+        this.accumulatedOutput.push(this.outputBuffer[i]);
+      }
+
+      this.bufferPos = 0;
+    } else if (this.bufferPos > 0) {
+      console.log(
+        `[RNNoise LIGHT] Discarding incomplete frame: ${this.bufferPos} samples (< ${RNNOISE_CONFIG.FRAME_SIZE})`
+      );
+      // Clear incomplete frame
+      this.bufferPos = 0;
+    }
+
+    // Send remaining accumulated output
+    if (this.accumulatedOutput.length > 0) {
+      console.log(
+        `[RNNoise LIGHT] Flushing ${this.accumulatedOutput.length} samples from accumulatedOutput`
+      );
+
+      const outputArray = new Float32Array(this.accumulatedOutput);
+      this.accumulatedOutput = [];
+
+      const { processed } = this.dynamicProcessor.process(outputArray);
+
+      const pcm16 = new Int16Array(processed.length);
+      for (let i = 0; i < processed.length; i++) {
+        const pcmValue = processed[i] * 32768;
+        pcm16[i] = Math.max(-32768, Math.min(32767, Math.round(pcmValue)));
+      }
+
+      console.log(`[RNNoise LIGHT] ✅ Flushed final ${pcm16.length} samples`);
+
+      this.port.postMessage(
+        {
+          type: "pcm16",
+          data: pcm16.buffer,
+        },
+        [pcm16.buffer]
+      );
+    }
+
+    console.log("[RNNoise LIGHT] ✅ Flush complete");
   }
 }
 

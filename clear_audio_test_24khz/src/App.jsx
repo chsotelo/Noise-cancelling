@@ -97,120 +97,45 @@ function App() {
       recorder.onstop = () => {
         // Verificar que el componente siga montado
         if (!isMountedRef.current) {
-          console.warn("Component unmounted, skipping audio generation");
           return;
         }
-
-        console.log(
-          `Total PCM16 chunks received: ${processedAudioChunksRef.current.length}`
-        );
 
         // --- Generar audio ORIGINAL ---
         if (originalAudioChunksRef.current.length > 0) {
           const originalBlob = new Blob(originalAudioChunksRef.current);
-          setOriginalAudioUrl(URL.createObjectURL(originalBlob));
-        } else {
-          console.warn("No original audio chunks received!");
+          const originalUrl = URL.createObjectURL(originalBlob);
+          setOriginalAudioUrl(originalUrl);
         }
 
         // --- Generar audio PROCESADO ---
         if (processedAudioChunksRef.current.length > 0) {
-          // Calcular duración real de la grabación
-          const recordingDuration =
-            (recordingStopTimeRef.current - recordingStartTimeRef.current) /
-            1000; // en segundos
-          const expectedSamples = Math.floor(
-            recordingDuration *
-              AUDIO_CAPTURE_CONFIG.TRANSMISSION_SAMPLE_RATE *
-              AUDIO_CAPTURE_CONFIG.CHANNELS
-          );
+          // NO truncar - usar TODOS los samples recibidos del worklet
+          // El worklet ya hace flush completo y envía exactamente lo que debe
+          const allChunks = processedAudioChunksRef.current;
 
-          console.log(
-            `Recording duration: ${recordingDuration.toFixed(
-              3
-            )}s, expected ${expectedSamples} samples`
-          );
-
-          // Concatenar y truncar al número exacto de samples
           let totalSamples = 0;
-          for (const chunk of processedAudioChunksRef.current) {
+          for (const chunk of allChunks) {
             totalSamples += chunk.length;
           }
 
-          console.log(
-            `Total samples received: ${totalSamples}, trimming to: ${expectedSamples}`
-          );
-
-          // Truncar chunks para que coincidan con la duración real
-          const trimmedChunks = [];
-          let samplesCollected = 0;
-
-          for (const chunk of processedAudioChunksRef.current) {
-            if (samplesCollected >= expectedSamples) break;
-
-            const samplesNeeded = expectedSamples - samplesCollected;
-            if (chunk.length <= samplesNeeded) {
-              // Chunk completo cabe
-              trimmedChunks.push(chunk);
-              samplesCollected += chunk.length;
-            } else {
-              // Necesitamos solo parte del chunk
-              const partialChunk = chunk.slice(0, samplesNeeded);
-              trimmedChunks.push(partialChunk);
-              samplesCollected += partialChunk.length;
-              break;
-            }
-          }
-
-          // Validar que los samples no sean todos ceros
-          let nonZeroSamples = 0;
-          let minSample = 32767;
-          let maxSample = -32768;
-          for (const chunk of trimmedChunks) {
-            for (let i = 0; i < chunk.length; i++) {
-              if (chunk[i] !== 0) nonZeroSamples++;
-              if (chunk[i] < minSample) minSample = chunk[i];
-              if (chunk[i] > maxSample) maxSample = chunk[i];
-            }
-          }
-
-          console.log(`Audio validation:`);
-          console.log(`  Total samples: ${samplesCollected}`);
-          console.log(
-            `  Non-zero samples: ${nonZeroSamples} (${(
-              (nonZeroSamples / samplesCollected) *
-              100
-            ).toFixed(2)}%)`
-          );
-          console.log(`  Sample range: [${minSample}, ${maxSample}]`);
-
-          if (nonZeroSamples === 0) {
-            console.error(
-              "⚠️ WARNING: All samples are zero! Audio will be silent."
-            );
-          }
-
           const processedBlob = encodeWAV(
-            trimmedChunks,
+            allChunks,
             AUDIO_CAPTURE_CONFIG.TRANSMISSION_SAMPLE_RATE,
             AUDIO_CAPTURE_CONFIG.CHANNELS
           );
           setProcessedAudioUrl(URL.createObjectURL(processedBlob));
-          console.log(
-            `Processed audio created: ${processedBlob.size} bytes (trimmed from ${totalSamples} to ${samplesCollected} samples)`
-          );
-        } else {
-          console.warn("No processed audio chunks received!");
         }
       };
 
-      // Iniciar grabación sin timeslice para capturar todo hasta que se detenga manualmente
-      // Si necesitas chunks periódicos, usa recorder.start(1000) por ejemplo
+      // CRITICAL: Wait for worklet to receive first audio, THEN start MediaRecorder
+      await localAudioService.startProcessing();
+
+      // NOW start recording - this ensures MediaRecorder starts exactly when worklet has real audio
       recordingStartTimeRef.current = Date.now();
       recorder.start();
+
       setIsRecording(true);
     } catch (error) {
-      console.error("Failed to start recording:", error);
       // El servicio de audio ya habrá puesto su propio estado de error
     }
   };
@@ -219,8 +144,13 @@ function App() {
     if (!isRecording) return;
 
     recordingStopTimeRef.current = Date.now();
+
+    // CRITICAL ORDER: Stop MediaRecorder FIRST to mark the exact stop point
     mediaRecorderRef.current?.stop();
+
+    // Then stop audio processing and flush buffers
     localAudioService.stop();
+
     setIsRecording(false);
   }, [isRecording]);
   const handleDeviceChange = (e) => {

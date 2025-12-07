@@ -70,11 +70,6 @@ class LocalAudioService {
     this.currentMode = detectedMode;
     this.currentModeConfig = AUDIO_MODES[detectedMode];
 
-    console.log(
-      `🚀 Starting audio service in ${detectedMode} mode`,
-      this.currentModeConfig
-    );
-
     this.#setToast(`Audio Mode: ${this.currentModeConfig.name}`);
 
     try {
@@ -85,9 +80,6 @@ class LocalAudioService {
         error.name === "NotReadableError" &&
         this.#selectedDeviceId !== "default"
       ) {
-        console.warn(
-          `Mic '${this.#selectedDeviceId}' is in use. Falling back to default.`
-        );
         this.#selectedDeviceId = "default";
         this.#setToast("Microphone is in use, switched to default device.");
         try {
@@ -112,7 +104,50 @@ class LocalAudioService {
     }
   }
 
+  startProcessing() {
+    // Tell worklet to start processing audio NOW and wait for first audio confirmation
+    return new Promise((resolve) => {
+      if (this.workletNode) {
+        // Listen for first audio signal from worklet
+        const firstAudioHandler = (event) => {
+          if (event.data?.type === "firstAudio") {
+            this.workletNode.port.removeEventListener(
+              "message",
+              firstAudioHandler
+            );
+            resolve();
+          }
+        };
+
+        this.workletNode.port.addEventListener("message", firstAudioHandler);
+        this.workletNode.port.postMessage("start");
+
+        // Fallback: resolve after 500ms even if no audio detected
+        setTimeout(() => {
+          this.workletNode.port.removeEventListener(
+            "message",
+            firstAudioHandler
+          );
+          resolve();
+        }, 500);
+      } else {
+        resolve();
+      }
+    });
+  }
+
   stop() {
+    // Stop processing immediately - no more output
+    if (this.workletNode) {
+      this.workletNode.port.postMessage("stop");
+      this.workletNode.port.postMessage("flush");
+    }
+
+    // Disconnect audio source to stop input flow
+    if (this.microphoneSource) {
+      this.microphoneSource.disconnect();
+    }
+
     this.onProcessedDataCallback = null;
     this.#destroy();
     this.#setState(AudioServiceStatus.IDLE);
@@ -193,15 +228,10 @@ class LocalAudioService {
       try {
         await tempContext.audioWorklet.addModule(workletURL.href);
       } catch (moduleError) {
-        console.error(
-          `Failed to load ${this.currentMode} worklet module:`,
-          moduleError
-        );
         throw new Error(`${this.currentMode} module loading failed`);
       }
 
       // Load WASM for pre-initialization
-      console.log(`📦 Pre-loading WASM for ${this.currentMode} mode...`);
       let wasmBytes, modelBytes;
 
       if (this.currentMode === "PREMIUM") {
@@ -209,14 +239,8 @@ class LocalAudioService {
           WasmLoader.loadDeepFilterNetWasm(),
           WasmLoader.loadDeepFilterNetModel(),
         ]);
-        console.log(
-          `✓ Pre-loaded DeepFilterNet WASM (${wasmBytes.byteLength} bytes) and model (${modelBytes.byteLength} bytes)`
-        );
       } else {
         wasmBytes = await WasmLoader.loadRNNoiseWasm();
-        console.log(
-          `✓ Pre-loaded RNNoise WASM (${wasmBytes.byteLength} bytes)`
-        );
       }
 
       const processorName = this.getProcessorName(this.currentMode);
@@ -258,11 +282,7 @@ class LocalAudioService {
       this.preInitContext = tempContext;
       this.preInitWorklet = tempWorklet;
       this.dtlnInitialized = true;
-      console.log(
-        `${this.currentMode} model pre-initialization successful @ ${this.currentModeConfig.PROCESSING_SAMPLE_RATE}Hz`
-      );
     } catch (error) {
-      console.error("Model pre-initialization failed:", error);
       // Limpiar recursos si falló
       if (this.preInitContext) {
         try {
@@ -280,10 +300,33 @@ class LocalAudioService {
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         deviceId: deviceId === "default" ? undefined : { exact: deviceId },
+
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // Disable all browser processing - we handle everything in worklets
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         echoCancellation: false,
         noiseSuppression: false,
         autoGainControl: false,
-        // No forzar channelCount, dejar que el navegador decida
+
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // Request highest quality capture settings
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        sampleRate: { ideal: 48000 }, // Maximum sample rate for best frequency resolution
+        sampleSize: { ideal: 16 }, // 16-bit PCM (standard for voice)
+        channelCount: { ideal: 1 }, // Mono (required for processing)
+
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // Advanced constraints for studio-grade capture
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        latency: { ideal: 0.01 }, // 10ms target latency (low-latency mode)
+
+        // Advanced processing disabled (some browsers support these)
+        googEchoCancellation: false,
+        googAutoGainControl: false,
+        googNoiseSuppression: false,
+        googHighpassFilter: false,
+        googTypingNoiseDetection: false,
+        googAudioMirroring: false,
       },
     });
   }
@@ -291,10 +334,6 @@ class LocalAudioService {
   async #setupAudioProcessing() {
     try {
       const processingRate = this.currentModeConfig.PROCESSING_SAMPLE_RATE;
-
-      console.log(
-        `⚙️ Setting up audio processing @ ${processingRate}Hz (${this.currentMode} mode)`
-      );
 
       // Reutilizar el contexto pre-inicializado si está disponible
       if (this.preInitContext && this.preInitContext.state !== "closed") {
@@ -307,11 +346,8 @@ class LocalAudioService {
           await this.audioContext.resume();
         }
 
-        console.log("✓ Reusing pre-initialized AudioContext");
-
         // Asegurarse de que el worklet esté listo
         if (!this.dtlnInitialized) {
-          console.warn("Model was not properly initialized");
           throw new Error("Model not ready, forcing re-initialization");
         }
       } else {
@@ -333,7 +369,6 @@ class LocalAudioService {
         await this.audioContext.audioWorklet.addModule(workletURL.href);
 
         // Load WASM files based on current mode
-        console.log(`📦 Loading WASM for ${this.currentMode} mode...`);
         let wasmBytes, modelBytes;
 
         if (this.currentMode === "PREMIUM") {
@@ -342,13 +377,9 @@ class LocalAudioService {
             WasmLoader.loadDeepFilterNetWasm(),
             WasmLoader.loadDeepFilterNetModel(),
           ]);
-          console.log(
-            `✓ Loaded DeepFilterNet WASM (${wasmBytes.byteLength} bytes) and model (${modelBytes.byteLength} bytes)`
-          );
         } else {
           // RNNoise only needs WASM binary
           wasmBytes = await WasmLoader.loadRNNoiseWasm();
-          console.log(`✓ Loaded RNNoise WASM (${wasmBytes.byteLength} bytes)`);
         }
 
         const processorName = this.getProcessorName(this.currentMode);
@@ -386,8 +417,6 @@ class LocalAudioService {
         if (!modelReady) {
           throw new Error(`${this.currentMode} model failed to initialize`);
         }
-
-        console.log(`✓ ${this.currentMode} model initialized successfully`);
       }
 
       this.microphoneSource = this.audioContext.createMediaStreamSource(
@@ -400,7 +429,6 @@ class LocalAudioService {
         this.microphoneSource.connect(this.workletNode);
         // No conectar a destination - solo procesamos, no reproducimos
       } catch (connectionError) {
-        console.error("Failed to connect audio nodes:", connectionError);
         throw new Error("Audio processing pipeline connection failed");
       }
 

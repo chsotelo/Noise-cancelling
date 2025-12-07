@@ -203,13 +203,15 @@ export class DeviceCapabilityDetector {
           const avgFrameTime = cpuSamples.reduce((a, b) => a + b) / maxSamples;
           const variance = this.calculateVariance(cpuSamples);
 
+          // AJUSTADO: Umbrales más realistas para evitar falsas alarmas
+          // 50ms = 20 FPS (muy malo), 100 varianza = frames muy inestables
           // Alta varianza + frameTime alto = CPU sobrecargada
-          if (avgFrameTime > 20 || variance > 50) {
+          if (avgFrameTime > 50 && variance > 100) {
             console.warn("⚠️ High CPU load detected, suggesting DOWNGRADE");
             callback("DOWNGRADE");
           }
           // Baja varianza + frameTime bajo = CPU disponible
-          else if (avgFrameTime < 8 && variance < 10) {
+          else if (avgFrameTime < 10 && variance < 20) {
             console.log("✅ Low CPU load, safe to UPGRADE");
             callback("UPGRADE");
           }
