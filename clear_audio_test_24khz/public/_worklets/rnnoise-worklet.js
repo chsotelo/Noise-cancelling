@@ -409,6 +409,127 @@ var createRNNWasmModule = (() => {
 var rnnoise_default = createRNNWasmModule;
 
 // src/utils/audioResampler.js
+var AudioResampler = class {
+  constructor() {
+    this.decimationFactor = 2;
+    this.cutoffFreq = 0.4;
+    this.filterOrder = 63;
+    this.beta = 7.5;
+    this.filterCoeffs = this.designKaiserLowpass(
+      this.filterOrder,
+      this.cutoffFreq,
+      this.beta
+    );
+    this.stateBuffer = new Float32Array(this.filterOrder);
+    this.statePos = 0;
+    console.log(
+      `[Resampler] Initialized: ${this.filterOrder}-tap Kaiser FIR, cutoff=${this.cutoffFreq}`
+    );
+  }
+  /**
+   * Design Kaiser-windowed lowpass FIR filter
+   * @param {number} order - Filter order (number of taps)
+   * @param {number} cutoff - Normalized cutoff frequency (0-1)
+   * @param {number} beta - Kaiser window beta parameter
+   * @returns {Float32Array} Filter coefficients
+   */
+  designKaiserLowpass(order, cutoff, beta) {
+    const M = order;
+    const coeffs = new Float32Array(M + 1);
+    const center = M / 2;
+    for (let n = 0; n <= M; n++) {
+      if (n === center) {
+        coeffs[n] = 2 * cutoff;
+      } else {
+        const x = (n - center) * Math.PI;
+        coeffs[n] = Math.sin(2 * cutoff * x) / x * this.kaiserWindow(n, M, beta);
+      }
+    }
+    const sum = coeffs.reduce((a, b) => a + b, 0);
+    for (let i = 0; i <= M; i++) {
+      coeffs[i] /= sum;
+    }
+    return coeffs;
+  }
+  /**
+   * Kaiser window function
+   * @param {number} n - Sample index
+   * @param {number} M - Window length - 1
+   * @param {number} beta - Shape parameter
+   * @returns {number} Window value
+   */
+  kaiserWindow(n, M, beta) {
+    const arg = beta * Math.sqrt(1 - Math.pow(2 * n / M - 1, 2));
+    return this.besselI0(arg) / this.besselI0(beta);
+  }
+  /**
+   * Modified Bessel function of the first kind, order 0
+   * Used in Kaiser window calculation
+   * @param {number} x - Input value
+   * @returns {number} I0(x)
+   */
+  besselI0(x) {
+    let sum = 1;
+    let term = 1;
+    let m = 1;
+    while (m < 25) {
+      term *= x * x / (4 * m * m);
+      sum += term;
+      m++;
+    }
+    return sum;
+  }
+  /**
+   * Apply FIR filter to input buffer
+   * @param {Float32Array} input - Input samples @ 48kHz
+   * @returns {Float32Array} Filtered samples @ 48kHz
+   */
+  applyFirFilter(input) {
+    const output = new Float32Array(input.length);
+    const M = this.filterOrder;
+    for (let n = 0; n < input.length; n++) {
+      let sum = 0;
+      for (let k = 0; k <= M; k++) {
+        const idx = n - k;
+        let sample;
+        if (idx >= 0) {
+          sample = input[idx];
+        } else {
+          const stateIdx = (this.statePos + idx + this.stateBuffer.length) % this.stateBuffer.length;
+          sample = this.stateBuffer[stateIdx];
+        }
+        sum += this.filterCoeffs[k] * sample;
+      }
+      output[n] = sum;
+    }
+    for (let i = 0; i < Math.min(M, input.length); i++) {
+      this.stateBuffer[(this.statePos + i) % this.stateBuffer.length] = input[input.length - M + i];
+    }
+    this.statePos = (this.statePos + Math.min(M, input.length)) % this.stateBuffer.length;
+    return output;
+  }
+  /**
+   * Resample 48kHz → 24kHz with anti-aliasing
+   * @param {Float32Array} input48k - Input samples @ 48kHz
+   * @returns {Float32Array} Output samples @ 24kHz
+   */
+  resample48to24(input48k) {
+    const filtered = this.applyFirFilter(input48k);
+    const outputLength = Math.floor(filtered.length / this.decimationFactor);
+    const output24k = new Float32Array(outputLength);
+    for (let i = 0; i < outputLength; i++) {
+      output24k[i] = filtered[i * this.decimationFactor];
+    }
+    return output24k;
+  }
+  /**
+   * Reset filter state (call when starting new stream)
+   */
+  reset() {
+    this.stateBuffer.fill(0);
+    this.statePos = 0;
+  }
+};
 var AudioDynamicProcessor = class {
   constructor() {
     this.targetRMS = 0.58;
@@ -497,15 +618,90 @@ var AudioDynamicProcessor = class {
     };
   }
 };
+var CircularBuffer = class {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.buffer = new Float32Array(capacity);
+    this.writePos = 0;
+    this.readPos = 0;
+    this.available = 0;
+  }
+  /**
+   * Push a single sample into the buffer
+   */
+  push(sample) {
+    this.buffer[this.writePos] = sample;
+    this.writePos = (this.writePos + 1) % this.capacity;
+    if (this.available < this.capacity) {
+      this.available++;
+    } else {
+      this.readPos = (this.readPos + 1) % this.capacity;
+    }
+  }
+  /**
+   * Get number of samples available to read
+   */
+  get length() {
+    return this.available;
+  }
+  /**
+   * Read N samples into a new Float32Array (non-destructive peek)
+   * Use this when you need to pass data to WASM or other APIs
+   */
+  peek(count) {
+    if (count > this.available) {
+      throw new Error(
+        `Cannot peek ${count} samples, only ${this.available} available`
+      );
+    }
+    const result = new Float32Array(count);
+    let readIdx = this.readPos;
+    for (let i = 0; i < count; i++) {
+      result[i] = this.buffer[readIdx];
+      readIdx = (readIdx + 1) % this.capacity;
+    }
+    return result;
+  }
+  /**
+   * Consume N samples (advance read position)
+   */
+  consume(count) {
+    if (count > this.available) {
+      throw new Error(
+        `Cannot consume ${count} samples, only ${this.available} available`
+      );
+    }
+    this.readPos = (this.readPos + count) % this.capacity;
+    this.available -= count;
+  }
+  /**
+   * Read and consume N samples in one operation
+   */
+  read(count) {
+    const data = this.peek(count);
+    this.consume(count);
+    return data;
+  }
+  /**
+   * Clear the buffer
+   */
+  clear() {
+    this.readPos = 0;
+    this.writePos = 0;
+    this.available = 0;
+  }
+};
 
 // src/worklets/rnnoise-worklet.source.js
 var RNNOISE_CONFIG = {
-  SAMPLE_RATE: 24e3,
-  FRAME_SIZE: 480,
-  // RNNoise uses 480 samples per frame (10ms @ 48kHz)
-  PCM_FREQUENCY: 48e3
-  // RNNoise internally works at 48kHz
+  PROCESSING_RATE: 48e3,
+  // RNNoise procesa @ 48kHz
+  OUTPUT_RATE: 24e3,
+  // Resampleado a 24kHz para backend
+  FRAME_SIZE: 480
+  // 10ms @ 48kHz (frame nativo de RNNoise)
 };
+var MIN_CHUNK_SIZE_48KHZ = 960;
 var rnnoiseWasmModule = null;
 var rnnoiseInitPromise = null;
 var RNNoiseLightProcessor = class extends AudioWorkletProcessor {
@@ -517,9 +713,9 @@ var RNNoiseLightProcessor = class extends AudioWorkletProcessor {
     this.outputBuffer = new Float32Array(RNNOISE_CONFIG.FRAME_SIZE);
     this.bufferPos = 0;
     this.preInitBuffer = [];
-    this.MAX_PREINIT_BUFFER = 24e3 * 2;
-    this.accumulatedOutput = [];
-    this.MIN_SEND_SIZE = 480;
+    this.MAX_PREINIT_BUFFER = 48e3 * 2;
+    this.resampler = new AudioResampler();
+    this.downsampleBuffer = new CircularBuffer(4096);
     this.dynamicProcessor = new AudioDynamicProcessor();
     this.heapInputBuffer = null;
     this.heapOutputBuffer = null;
@@ -576,9 +772,13 @@ var RNNoiseLightProcessor = class extends AudioWorkletProcessor {
         throw new Error("Failed to allocate WASM heap buffers");
       }
       this.initialized = true;
-      console.log("[RNNoise LIGHT] \u2705 Initialized successfully @ 24kHz");
-      console.log("  Frame size:", RNNOISE_CONFIG.FRAME_SIZE);
-      console.log("  Sample rate:", RNNOISE_CONFIG.SAMPLE_RATE);
+      console.log("[RNNoise LIGHT] \u2705 Initialized successfully!");
+      console.log(
+        `[RNNoise LIGHT] Processing: ${RNNOISE_CONFIG.PROCESSING_RATE}Hz \u2192 Output: ${RNNOISE_CONFIG.OUTPUT_RATE}Hz`
+      );
+      console.log(
+        `[RNNoise LIGHT] Frame size: ${RNNOISE_CONFIG.FRAME_SIZE} samples (10ms @ 48kHz)`
+      );
       this.port.postMessage("ready");
     } catch (error) {
       console.error("[RNNoise LIGHT] \u274C Initialization failed:", error);
@@ -639,14 +839,16 @@ var RNNoiseLightProcessor = class extends AudioWorkletProcessor {
     }
     if (outputWritePos > 0) {
       for (let i = 0; i < RNNOISE_CONFIG.FRAME_SIZE; i++) {
-        this.accumulatedOutput.push(this.outputBuffer[i]);
+        this.downsampleBuffer.push(this.outputBuffer[i]);
       }
       outputWritePos = 0;
       outputReadPos = 0;
     }
-    if (this.accumulatedOutput.length >= this.MIN_SEND_SIZE) {
-      const audioBuffer = new Float32Array(this.accumulatedOutput);
-      const { processed, gainApplied, rms, peak, saturated } = this.dynamicProcessor.process(audioBuffer);
+    if (this.downsampleBuffer.length >= MIN_CHUNK_SIZE_48KHZ) {
+      const samplesToProcess = Math.floor(this.downsampleBuffer.length / 2) * 2;
+      const input48k = this.downsampleBuffer.read(samplesToProcess);
+      const resampled24k = this.resampler.resample48to24(input48k);
+      const { processed, gainApplied, rms, peak, saturated } = this.dynamicProcessor.process(resampled24k);
       const pcm16 = new Int16Array(processed.length);
       for (let i = 0; i < processed.length; i++) {
         const pcmValue = processed[i] * 32768;
@@ -656,7 +858,7 @@ var RNNoiseLightProcessor = class extends AudioWorkletProcessor {
       if (this.frameCount % 50 === 0) {
         const satIcon = saturated ? "\u{1F534}" : "\u{1F7E2}";
         console.log(
-          `[RNNoise] ${satIcon} PCM16: ${pcm16.length} samples @ 24kHz | Gain: ${gainApplied.toFixed(2)}x | RMS: ${(rms * 100).toFixed(
+          `[RNNoise LIGHT] ${satIcon} PCM16: ${pcm16.length} samples @ 24kHz | Gain: ${gainApplied.toFixed(2)}x | RMS: ${(rms * 100).toFixed(
             1
           )}% | Peak: ${(peak * 100).toFixed(1)}%`
         );
@@ -668,7 +870,6 @@ var RNNoiseLightProcessor = class extends AudioWorkletProcessor {
         },
         [pcm16.buffer]
       );
-      this.accumulatedOutput = [];
     }
     this.outputReadPos = outputReadPos;
     this.outputWritePos = outputWritePos;
@@ -711,7 +912,7 @@ var RNNoiseLightProcessor = class extends AudioWorkletProcessor {
       );
       this.processFrame();
       for (let i = 0; i < this.outputBuffer.length; i++) {
-        this.accumulatedOutput.push(this.outputBuffer[i]);
+        this.downsampleBuffer.push(this.outputBuffer[i]);
       }
       this.bufferPos = 0;
     } else if (this.bufferPos > 0) {
@@ -720,13 +921,14 @@ var RNNoiseLightProcessor = class extends AudioWorkletProcessor {
       );
       this.bufferPos = 0;
     }
-    if (this.accumulatedOutput.length > 0) {
+    if (this.downsampleBuffer.length > 0) {
       console.log(
-        `[RNNoise LIGHT] Flushing ${this.accumulatedOutput.length} samples from accumulatedOutput`
+        `[RNNoise LIGHT] Flushing ${this.downsampleBuffer.length} samples from downsampleBuffer`
       );
-      const outputArray = new Float32Array(this.accumulatedOutput);
-      this.accumulatedOutput = [];
-      const { processed } = this.dynamicProcessor.process(outputArray);
+      const samplesToFlush = Math.floor(this.downsampleBuffer.length / 2) * 2;
+      const input48k = this.downsampleBuffer.read(samplesToFlush);
+      const resampled24k = this.resampler.resample48to24(input48k);
+      const { processed } = this.dynamicProcessor.process(resampled24k);
       const pcm16 = new Int16Array(processed.length);
       for (let i = 0; i < processed.length; i++) {
         const pcmValue = processed[i] * 32768;

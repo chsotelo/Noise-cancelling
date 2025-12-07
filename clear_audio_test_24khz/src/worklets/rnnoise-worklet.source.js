@@ -1,18 +1,26 @@
-// RNNoise Audio Worklet Source (LIGHT mode @ 24kHz)
+// RNNoise Audio Worklet Source (LIGHT mode)
+// Entrada: 48kHz nativo → RNNoise @ 48kHz → Salida: 24kHz
 // Bundled with esbuild - imports Emscripten module directly
 
 // Import the Emscripten-generated module
 import createRNNWasmModule from "../../public/_worklets/rnnoise.js";
 
-// Import audio dynamic processor for consistent quality
-import { AudioDynamicProcessor } from "../../src/utils/audioResampler.js";
+// Import audio processing utilities (same as DeepFilterNet)
+import {
+  AudioResampler,
+  AudioDynamicProcessor,
+  CircularBuffer,
+} from "../../src/utils/audioResampler.js";
 
-// RNNoise configuration
+// RNNoise configuration (same architecture as DeepFilterNet)
 const RNNOISE_CONFIG = {
-  SAMPLE_RATE: 24000,
-  FRAME_SIZE: 480, // RNNoise uses 480 samples per frame (10ms @ 48kHz)
-  PCM_FREQUENCY: 48000, // RNNoise internally works at 48kHz
+  PROCESSING_RATE: 48000, // RNNoise procesa @ 48kHz
+  OUTPUT_RATE: 24000, // Resampleado a 24kHz para backend
+  FRAME_SIZE: 480, // 10ms @ 48kHz (frame nativo de RNNoise)
 };
+
+// Minimum chunk size for efficient resampling (must be even for 2:1 decimation)
+const MIN_CHUNK_SIZE_48KHZ = 960; // 20ms @ 48kHz -> 10ms @ 24kHz
 
 // Global WASM module instance
 let rnnoiseWasmModule = null;
@@ -25,18 +33,18 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
     this.initialized = false;
     this.rnnoiseState = null;
 
-    // Processing buffers
+    // Processing buffers @ 48kHz (RNNoise native)
     this.inputBuffer = new Float32Array(RNNOISE_CONFIG.FRAME_SIZE);
     this.outputBuffer = new Float32Array(RNNOISE_CONFIG.FRAME_SIZE);
     this.bufferPos = 0;
 
     // CRITICAL: Pre-initialization buffer to store audio BEFORE model is ready
     this.preInitBuffer = [];
-    this.MAX_PREINIT_BUFFER = 24000 * 2; // 2 seconds max @ 24kHz
+    this.MAX_PREINIT_BUFFER = 48000 * 2; // 2 seconds max @ 48kHz
 
-    // Accumulation buffer for sending larger chunks (reduce fragmentation)
-    this.accumulatedOutput = [];
-    this.MIN_SEND_SIZE = 480; // 20ms @ 24kHz (reduced from 100ms for lower latency)
+    // High-quality resampler (48kHz -> 24kHz with anti-aliasing)
+    this.resampler = new AudioResampler();
+    this.downsampleBuffer = new CircularBuffer(4096); // ~85ms buffer @ 48kHz
 
     // Dynamic audio processor (adaptive gain + soft limiter)
     this.dynamicProcessor = new AudioDynamicProcessor();
@@ -128,9 +136,13 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
 
       this.initialized = true;
 
-      console.log("[RNNoise LIGHT] ✅ Initialized successfully @ 24kHz");
-      console.log("  Frame size:", RNNOISE_CONFIG.FRAME_SIZE);
-      console.log("  Sample rate:", RNNOISE_CONFIG.SAMPLE_RATE);
+      console.log("[RNNoise LIGHT] ✅ Initialized successfully!");
+      console.log(
+        `[RNNoise LIGHT] Processing: ${RNNOISE_CONFIG.PROCESSING_RATE}Hz → Output: ${RNNOISE_CONFIG.OUTPUT_RATE}Hz`
+      );
+      console.log(
+        `[RNNoise LIGHT] Frame size: ${RNNOISE_CONFIG.FRAME_SIZE} samples (10ms @ 48kHz)`
+      );
 
       // Notify main thread
       this.port.postMessage("ready");
@@ -201,12 +213,12 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
     let outputReadPos = this.outputReadPos || 0;
     let outputWritePos = this.outputWritePos || 0;
 
-    // Process input samples
+    // Process input samples @ 48kHz
     for (let i = 0; i < blockSize; i++) {
-      // Accumulate input
+      // Accumulate input @ 48kHz
       this.inputBuffer[this.bufferPos++] = inputChannel[i];
 
-      // When we have a complete frame, process it
+      // When we have a complete frame @ 48kHz, process it
       if (this.bufferPos >= RNNOISE_CONFIG.FRAME_SIZE) {
         this.processFrame();
         this.bufferPos = 0;
@@ -216,31 +228,38 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
       }
     }
 
-    // Accumulate processed frames before sending
-    // RNNoise already outputs at 24kHz, no downsampling needed
+    // Accumulate processed frames @ 48kHz for resampling
     if (outputWritePos > 0) {
-      // Add processed frame to accumulation buffer
+      // Push entire processed frame to downsample buffer
       for (let i = 0; i < RNNOISE_CONFIG.FRAME_SIZE; i++) {
-        this.accumulatedOutput.push(this.outputBuffer[i]);
+        this.downsampleBuffer.push(this.outputBuffer[i]);
       }
 
       outputWritePos = 0;
       outputReadPos = 0;
     }
 
-    // Send accumulated frames when we have enough data (20ms chunks - reduced latency)
-    if (this.accumulatedOutput.length >= this.MIN_SEND_SIZE) {
-      // Convert accumulated output to Float32Array for processing
-      const audioBuffer = new Float32Array(this.accumulatedOutput);
+    // Check if we have enough samples @ 48kHz for resampling (same as DeepFilterNet)
+    if (this.downsampleBuffer.length >= MIN_CHUNK_SIZE_48KHZ) {
+      // Calculate how many complete chunks we can create (even number for proper decimation)
+      const samplesToProcess = Math.floor(this.downsampleBuffer.length / 2) * 2;
+
+      // Extract samples to process (zero-copy read)
+      const input48k = this.downsampleBuffer.read(samplesToProcess);
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // Apply adaptive gain normalization + soft limiting
+      // STEP 1: High-quality resampling with anti-aliasing FIR filter
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const resampled24k = this.resampler.resample48to24(input48k);
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // STEP 2: Adaptive gain normalization + soft limiting
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       const { processed, gainApplied, rms, peak, saturated } =
-        this.dynamicProcessor.process(audioBuffer);
+        this.dynamicProcessor.process(resampled24k);
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // Convert Float32 [-1, 1] to PCM16 [-32768, 32767]
+      // STEP 3: Convert Float32 [-1, 1] to PCM16 [-32768, 32767]
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       const pcm16 = new Int16Array(processed.length);
       for (let i = 0; i < processed.length; i++) {
@@ -253,7 +272,7 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
       if (this.frameCount % 50 === 0) {
         const satIcon = saturated ? "🔴" : "🟢";
         console.log(
-          `[RNNoise] ${satIcon} PCM16: ${pcm16.length} samples @ 24kHz | ` +
+          `[RNNoise LIGHT] ${satIcon} PCM16: ${pcm16.length} samples @ 24kHz | ` +
             `Gain: ${gainApplied.toFixed(2)}x | RMS: ${(rms * 100).toFixed(
               1
             )}% | Peak: ${(peak * 100).toFixed(1)}%`
@@ -267,9 +286,6 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
         },
         [pcm16.buffer]
       );
-
-      // Clear accumulated buffer
-      this.accumulatedOutput = [];
     }
 
     // Save state for next call
@@ -333,9 +349,9 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
       // Process final frame
       this.processFrame();
 
-      // Add to accumulated output
+      // Add to downsample buffer
       for (let i = 0; i < this.outputBuffer.length; i++) {
-        this.accumulatedOutput.push(this.outputBuffer[i]);
+        this.downsampleBuffer.push(this.outputBuffer[i]);
       }
 
       this.bufferPos = 0;
@@ -347,16 +363,20 @@ class RNNoiseLightProcessor extends AudioWorkletProcessor {
       this.bufferPos = 0;
     }
 
-    // Send remaining accumulated output
-    if (this.accumulatedOutput.length > 0) {
+    // Send remaining downsample buffer
+    if (this.downsampleBuffer.length > 0) {
       console.log(
-        `[RNNoise LIGHT] Flushing ${this.accumulatedOutput.length} samples from accumulatedOutput`
+        `[RNNoise LIGHT] Flushing ${this.downsampleBuffer.length} samples from downsampleBuffer`
       );
 
-      const outputArray = new Float32Array(this.accumulatedOutput);
-      this.accumulatedOutput = [];
+      // Process even number of samples for proper decimation
+      const samplesToFlush = Math.floor(this.downsampleBuffer.length / 2) * 2;
+      const input48k = this.downsampleBuffer.read(samplesToFlush);
 
-      const { processed } = this.dynamicProcessor.process(outputArray);
+      // Resample to 24kHz
+      const resampled24k = this.resampler.resample48to24(input48k);
+
+      const { processed } = this.dynamicProcessor.process(resampled24k);
 
       const pcm16 = new Int16Array(processed.length);
       for (let i = 0; i < processed.length; i++) {

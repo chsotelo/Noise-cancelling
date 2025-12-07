@@ -179,7 +179,7 @@ function App() {
           <option value="PREMIUM">
             ⚡ Premium (DeepFilterNet @ 48kHz → 24kHz)
           </option>
-          <option value="LIGHT">💡 Light (DTLN @ 24kHz)</option>
+          <option value="LIGHT">💡 Light (RNNoise @ 48kHz → 24kHz)</option>
         </select>
 
         <label htmlFor="mic-select">Micrófono:</label>

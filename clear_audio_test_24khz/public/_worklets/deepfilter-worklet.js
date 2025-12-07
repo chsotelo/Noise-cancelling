@@ -494,6 +494,79 @@ var AudioDynamicProcessor = class {
     };
   }
 };
+var CircularBuffer = class {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.buffer = new Float32Array(capacity);
+    this.writePos = 0;
+    this.readPos = 0;
+    this.available = 0;
+  }
+  /**
+   * Push a single sample into the buffer
+   */
+  push(sample) {
+    this.buffer[this.writePos] = sample;
+    this.writePos = (this.writePos + 1) % this.capacity;
+    if (this.available < this.capacity) {
+      this.available++;
+    } else {
+      this.readPos = (this.readPos + 1) % this.capacity;
+    }
+  }
+  /**
+   * Get number of samples available to read
+   */
+  get length() {
+    return this.available;
+  }
+  /**
+   * Read N samples into a new Float32Array (non-destructive peek)
+   * Use this when you need to pass data to WASM or other APIs
+   */
+  peek(count) {
+    if (count > this.available) {
+      throw new Error(
+        `Cannot peek ${count} samples, only ${this.available} available`
+      );
+    }
+    const result = new Float32Array(count);
+    let readIdx = this.readPos;
+    for (let i = 0; i < count; i++) {
+      result[i] = this.buffer[readIdx];
+      readIdx = (readIdx + 1) % this.capacity;
+    }
+    return result;
+  }
+  /**
+   * Consume N samples (advance read position)
+   */
+  consume(count) {
+    if (count > this.available) {
+      throw new Error(
+        `Cannot consume ${count} samples, only ${this.available} available`
+      );
+    }
+    this.readPos = (this.readPos + count) % this.capacity;
+    this.available -= count;
+  }
+  /**
+   * Read and consume N samples in one operation
+   */
+  read(count) {
+    const data = this.peek(count);
+    this.consume(count);
+    return data;
+  }
+  /**
+   * Clear the buffer
+   */
+  clear() {
+    this.readPos = 0;
+    this.writePos = 0;
+    this.available = 0;
+  }
+};
 
 // src/worklets/deepfilter-worklet.source.js
 var wasmInitialized = false;
@@ -505,9 +578,9 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
     this.initialized = false;
     this.dfState = null;
     this.frameLength = 0;
-    this.inputBuffer = [];
+    this.inputBuffer = new CircularBuffer(2048);
     this.resampler = new AudioResampler();
-    this.downsampleBuffer = [];
+    this.downsampleBuffer = new CircularBuffer(4096);
     this.dynamicProcessor = new AudioDynamicProcessor();
     this.processedFrameCount = 0;
     this.FADEIN_FRAMES = 1;
@@ -598,8 +671,7 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
       this.inputBuffer.push(inputChannel[i]);
     }
     while (this.inputBuffer.length >= this.frameLength) {
-      const frameArray = this.inputBuffer.splice(0, this.frameLength);
-      const frame = new Float32Array(frameArray);
+      const frame = this.inputBuffer.read(this.frameLength);
       try {
         const processedFrame = df_process_frame(this.dfState, frame);
         this.processedFrameCount++;
@@ -623,11 +695,7 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
     const MIN_CHUNK_SIZE_48KHZ = MIN_CHUNK_SIZE_24KHZ * 2;
     if (this.downsampleBuffer.length >= MIN_CHUNK_SIZE_48KHZ) {
       const samplesToProcess = Math.floor(this.downsampleBuffer.length / 2) * 2;
-      const input48k = new Float32Array(samplesToProcess);
-      for (let i = 0; i < samplesToProcess; i++) {
-        input48k[i] = this.downsampleBuffer[i];
-      }
-      this.downsampleBuffer.splice(0, samplesToProcess);
+      const input48k = this.downsampleBuffer.read(samplesToProcess);
       const resampled24k = this.resampler.resample48to24(input48k);
       const { processed, gainApplied, rms, peak, saturated } = this.dynamicProcessor.process(resampled24k);
       const pcm16 = new Int16Array(processed.length);
@@ -655,8 +723,7 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
       return;
     }
     if (this.inputBuffer.length >= this.frameLength) {
-      const frameArray = this.inputBuffer.splice(0, this.frameLength);
-      const frame = new Float32Array(frameArray);
+      const frame = this.inputBuffer.read(this.frameLength);
       try {
         const processedFrame = df_process_frame(this.dfState, frame);
         for (let j = 0; j < processedFrame.length; j++) {
@@ -665,16 +732,12 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
       } catch (error) {
       }
     } else if (this.inputBuffer.length > 0) {
-      this.inputBuffer = [];
+      this.inputBuffer.clear();
     }
     if (this.downsampleBuffer.length > 0) {
       const samplesToProcess = Math.floor(this.downsampleBuffer.length / 2) * 2;
       if (samplesToProcess >= 2) {
-        const input48k = new Float32Array(samplesToProcess);
-        for (let i = 0; i < samplesToProcess; i++) {
-          input48k[i] = this.downsampleBuffer[i];
-        }
-        this.downsampleBuffer.splice(0, samplesToProcess);
+        const input48k = this.downsampleBuffer.read(samplesToProcess);
         const resampled24k = this.resampler.resample48to24(input48k);
         const { processed } = this.dynamicProcessor.process(resampled24k);
         const pcm16 = new Int16Array(processed.length);

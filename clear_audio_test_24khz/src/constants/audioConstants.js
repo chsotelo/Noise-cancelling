@@ -12,14 +12,14 @@ export const AUDIO_MODES = {
     description: "Fast noise suppression for low-end devices",
 
     CAPTURE_SAMPLE_RATE: 48000,
-    PROCESSING_SAMPLE_RATE: 24000, // Procesa directo a 24kHz
-    OUTPUT_SAMPLE_RATE: 24000, // Output obligatorio
+    PROCESSING_SAMPLE_RATE: 48000, // RNNoise procesa @ 48kHz
+    OUTPUT_SAMPLE_RATE: 24000, // Resampled to 24kHz para backend
 
     MODEL: "rnnoise", // RNNoise - stationary noise
-    FRAME_SIZE: 480, // 20ms @ 24kHz (10ms @ 48kHz RNNoise internal)
-    HOP_SIZE: 240, // 10ms overlap
+    FRAME_SIZE: 480, // 10ms @ 48kHz (frame nativo de RNNoise)
+    HOP_SIZE: 240, // 5ms overlap
 
-    USE_RESAMPLER: false, // No necesita resampling
+    USE_RESAMPLER: true, // AudioResampler 48kHz→24kHz con FIR anti-aliasing
 
     // Métricas esperadas
     EXPECTED_LATENCY_MS: 35,

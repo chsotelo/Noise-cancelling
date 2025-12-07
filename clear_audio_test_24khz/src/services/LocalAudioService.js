@@ -29,6 +29,7 @@ class LocalAudioService {
   dtlnInitialized = false;
   preInitContext = null;
   preInitWorklet = null;
+  preInitSilentSource = null; // Para detener el loop infinito
 
   onStateChange = () => {};
 
@@ -269,18 +270,20 @@ class LocalAudioService {
 
       await initPromise;
 
+      // FIXED: NO usar loop infinito - solo mantener contexto activo brevemente
       const silent = tempContext.createBufferSource();
       silent.buffer = tempContext.createBuffer(
         1,
-        1,
+        tempContext.sampleRate, // 1 segundo de silencio
         this.currentModeConfig.PROCESSING_SAMPLE_RATE
       );
-      silent.loop = true;
+      silent.loop = false; // CRITICAL: NO loop infinito
       silent.connect(tempWorklet);
       silent.start();
 
       this.preInitContext = tempContext;
       this.preInitWorklet = tempWorklet;
+      this.preInitSilentSource = silent; // Guardar referencia
       this.dtlnInitialized = true;
     } catch (error) {
       // Limpiar recursos si falló
@@ -339,6 +342,18 @@ class LocalAudioService {
       if (this.preInitContext && this.preInitContext.state !== "closed") {
         this.audioContext = this.preInitContext;
         this.workletNode = this.preInitWorklet;
+
+        // FIXED: Detener silentSource antes de perder la referencia
+        if (this.preInitSilentSource) {
+          try {
+            this.preInitSilentSource.stop();
+            this.preInitSilentSource.disconnect();
+          } catch (e) {
+            // Ya estaba detenido, ignorar
+          }
+          this.preInitSilentSource = null;
+        }
+
         this.preInitContext = null;
         this.preInitWorklet = null;
 
@@ -578,6 +593,17 @@ class LocalAudioService {
     if (this.runtimeMonitorId) {
       clearInterval(this.runtimeMonitorId);
       this.runtimeMonitorId = null;
+    }
+
+    // FIXED: Detener silentSource antes de cerrar contexto
+    if (this.preInitSilentSource) {
+      try {
+        this.preInitSilentSource.stop();
+        this.preInitSilentSource.disconnect();
+      } catch (e) {
+        // Ya estaba detenido
+      }
+      this.preInitSilentSource = null;
     }
 
     if (this.preInitWorklet) {

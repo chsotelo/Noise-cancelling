@@ -11,6 +11,7 @@ import init, {
 import {
   AudioResampler,
   AudioDynamicProcessor,
+  CircularBuffer,
 } from "../../src/utils/audioResampler.js";
 
 // Variable global para el WASM inicializado
@@ -26,12 +27,12 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
     this.dfState = null;
     this.frameLength = 0;
 
-    // Input buffer for accumulating samples
-    this.inputBuffer = [];
+    // Input buffer for accumulating samples (circular buffer to avoid splice)
+    this.inputBuffer = new CircularBuffer(2048); // 2048 = ~42ms buffer @ 48kHz
 
     // High-quality resampler (48kHz -> 24kHz with anti-aliasing)
     this.resampler = new AudioResampler();
-    this.downsampleBuffer = [];
+    this.downsampleBuffer = new CircularBuffer(4096); // 4096 = ~85ms buffer @ 48kHz
 
     // Dynamic audio processor (adaptive gain + soft limiter)
     this.dynamicProcessor = new AudioDynamicProcessor();
@@ -196,9 +197,8 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
 
     // Process complete frames
     while (this.inputBuffer.length >= this.frameLength) {
-      // Extract frame
-      const frameArray = this.inputBuffer.splice(0, this.frameLength);
-      const frame = new Float32Array(frameArray);
+      // Extract frame (zero-copy with circular buffer)
+      const frame = this.inputBuffer.read(this.frameLength);
 
       // Input validation removed for cleaner logs
 
@@ -243,14 +243,8 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
       // Calculate how many complete chunks we can create (even number for proper decimation)
       const samplesToProcess = Math.floor(this.downsampleBuffer.length / 2) * 2;
 
-      // Extract samples to process
-      const input48k = new Float32Array(samplesToProcess);
-      for (let i = 0; i < samplesToProcess; i++) {
-        input48k[i] = this.downsampleBuffer[i];
-      }
-
-      // Remove processed samples, keep remainder for next iteration
-      this.downsampleBuffer.splice(0, samplesToProcess);
+      // Extract samples to process (zero-copy read)
+      const input48k = this.downsampleBuffer.read(samplesToProcess);
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       // STEP 1: High-quality resampling with anti-aliasing FIR filter
@@ -304,8 +298,7 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
     // to avoid adding artificial silence
     if (this.inputBuffer.length >= this.frameLength) {
       // Process final complete frame
-      const frameArray = this.inputBuffer.splice(0, this.frameLength);
-      const frame = new Float32Array(frameArray);
+      const frame = this.inputBuffer.read(this.frameLength);
 
       try {
         const processedFrame = df_process_frame(this.dfState, frame);
@@ -317,7 +310,7 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
       }
     } else if (this.inputBuffer.length > 0) {
       // Clear incomplete frame to avoid artificial duration extension
-      this.inputBuffer = [];
+      this.inputBuffer.clear();
     }
 
     // Process remaining samples in downsampleBuffer
@@ -326,11 +319,7 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
       const samplesToProcess = Math.floor(this.downsampleBuffer.length / 2) * 2;
 
       if (samplesToProcess >= 2) {
-        const input48k = new Float32Array(samplesToProcess);
-        for (let i = 0; i < samplesToProcess; i++) {
-          input48k[i] = this.downsampleBuffer[i];
-        }
-        this.downsampleBuffer.splice(0, samplesToProcess);
+        const input48k = this.downsampleBuffer.read(samplesToProcess);
 
         const resampled24k = this.resampler.resample48to24(input48k);
         const { processed } = this.dynamicProcessor.process(resampled24k);

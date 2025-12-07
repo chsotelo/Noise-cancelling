@@ -291,3 +291,92 @@ export class AudioDynamicProcessor {
     };
   }
 }
+
+/**
+ * Circular Buffer for zero-copy audio buffering
+ * Eliminates Array.splice() overhead and reduces GC pressure
+ */
+export class CircularBuffer {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.buffer = new Float32Array(capacity);
+    this.writePos = 0;
+    this.readPos = 0;
+    this.available = 0;
+  }
+
+  /**
+   * Push a single sample into the buffer
+   */
+  push(sample) {
+    this.buffer[this.writePos] = sample;
+    this.writePos = (this.writePos + 1) % this.capacity;
+    if (this.available < this.capacity) {
+      this.available++;
+    } else {
+      // Buffer full, advance read position
+      this.readPos = (this.readPos + 1) % this.capacity;
+    }
+  }
+
+  /**
+   * Get number of samples available to read
+   */
+  get length() {
+    return this.available;
+  }
+
+  /**
+   * Read N samples into a new Float32Array (non-destructive peek)
+   * Use this when you need to pass data to WASM or other APIs
+   */
+  peek(count) {
+    if (count > this.available) {
+      throw new Error(
+        `Cannot peek ${count} samples, only ${this.available} available`
+      );
+    }
+
+    const result = new Float32Array(count);
+    let readIdx = this.readPos;
+
+    for (let i = 0; i < count; i++) {
+      result[i] = this.buffer[readIdx];
+      readIdx = (readIdx + 1) % this.capacity;
+    }
+
+    return result;
+  }
+
+  /**
+   * Consume N samples (advance read position)
+   */
+  consume(count) {
+    if (count > this.available) {
+      throw new Error(
+        `Cannot consume ${count} samples, only ${this.available} available`
+      );
+    }
+
+    this.readPos = (this.readPos + count) % this.capacity;
+    this.available -= count;
+  }
+
+  /**
+   * Read and consume N samples in one operation
+   */
+  read(count) {
+    const data = this.peek(count);
+    this.consume(count);
+    return data;
+  }
+
+  /**
+   * Clear the buffer
+   */
+  clear() {
+    this.readPos = 0;
+    this.writePos = 0;
+    this.available = 0;
+  }
+}
