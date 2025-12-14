@@ -1,42 +1,42 @@
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Modos de Procesamiento de Audio
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Audio Processing Modes
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 export const AUDIO_MODES = {
-  // ────────────────────────────────────────────────────────────
-  // LIGHT: Fallback para dispositivos con capacidad limitada
-  // ────────────────────────────────────────────────────────────
+  // ────────────────────────────────────────────────────────────────
+  // LIGHT: Fallback for devices with limited capacity
+  // ────────────────────────────────────────────────────────────────
   LIGHT: {
     id: "LIGHT",
-    name: "Light Mode (RNNoise)",
-    description: "Fast noise suppression for low-end devices",
+    name: "Light Mode",
+    description: "Fast noise suppression for clean environments",
 
     CAPTURE_SAMPLE_RATE: 48000,
-    PROCESSING_SAMPLE_RATE: 48000, // RNNoise procesa @ 48kHz
-    OUTPUT_SAMPLE_RATE: 24000, // Resampled to 24kHz para backend
+    PROCESSING_SAMPLE_RATE: 48000, // RNNoise processes @ 48kHz
+    OUTPUT_SAMPLE_RATE: 24000, // Resampled to 24kHz for backend
 
     MODEL: "rnnoise", // RNNoise - stationary noise
-    FRAME_SIZE: 480, // 10ms @ 48kHz (frame nativo de RNNoise)
+    FRAME_SIZE: 480, // 10ms @ 48kHz (RNNoise native frame)
     HOP_SIZE: 240, // 5ms overlap
 
-    USE_RESAMPLER: true, // AudioResampler 48kHz→24kHz con FIR anti-aliasing
+    USE_RESAMPLER: true, // AudioResampler 48kHz→24kHz with FIR anti-aliasing
 
-    // Métricas esperadas
+    // Expected metrics
     EXPECTED_LATENCY_MS: 35,
     EXPECTED_CPU_PERCENT: 10,
   },
 
   // ────────────────────────────────────────────────────────────
-  // PREMIUM: Modo por defecto para dispositivos modernos (2025)
+  // PREMIUM: Default mode for modern devices (2025)
   // ────────────────────────────────────────────────────────────
   PREMIUM: {
     id: "PREMIUM",
-    name: "Premium Mode (DeepFilterNet)",
-    description: "SOTA quality for non-stationary noise @ 48kHz → 24kHz",
+    name: "Premium Mode",
+    description: "SOTA quality for noisy environments @ 48kHz → 24kHz",
 
     CAPTURE_SAMPLE_RATE: 48000,
-    PROCESSING_SAMPLE_RATE: 48000, // Máxima resolución espectral
-    OUTPUT_SAMPLE_RATE: 24000, // Output obligatorio
+    PROCESSING_SAMPLE_RATE: 48000, // Maximum spectral resolution
+    OUTPUT_SAMPLE_RATE: 24000, // Required output
 
     MODEL: "deepfilternet", // DeepFilterNet - non-stationary noise
     FRAME_SIZE: 480, // 10ms @ 48kHz
@@ -44,34 +44,34 @@ export const AUDIO_MODES = {
 
     USE_RESAMPLER: true, // Rubato 48k→24k
     RESAMPLER_CONFIG: {
-      type: "rubato-fft", // Baja latencia
-      quality: "high", // Filtro anti-aliasing
+      type: "rubato-fft", // Low latency
+      quality: "high", // Anti-aliasing filter
     },
 
-    // Métricas esperadas
+    // Expected metrics
     EXPECTED_LATENCY_MS: 70,
     EXPECTED_CPU_PERCENT: 30,
   },
 };
 
 export const AUDIO_CAPTURE_CONFIG = {
-  // Modo por defecto (se sobrescribe con detección automática)
+  // Default mode (overridden with automatic detection)
   DEFAULT_MODE: "PREMIUM",
 
-  // Detección automática de capacidad
+  // Automatic capability detection
   AUTO_DETECT_MODE: true,
 
-  // Thresholds para switching dinámico
-  CPU_THRESHOLD_DOWNGRADE: 75, // % - Si CPU > 75%, bajar a LIGHT
-  CPU_THRESHOLD_UPGRADE: 40, // % - Si CPU < 40%, subir a PREMIUM
+  // Thresholds for dynamic switching
+  CPU_THRESHOLD_DOWNGRADE: 75, // % - If CPU > 75%, downgrade to LIGHT
+  CPU_THRESHOLD_UPGRADE: 40, // % - If CPU < 40%, upgrade to PREMIUM
 
-  // Output siempre a 24kHz (requisito obligatorio)
+  // Output always at 24kHz (mandatory requirement)
   TRANSMISSION_SAMPLE_RATE: 24000,
   CHANNELS: 1,
 
-  // Configuración de captura
+  // Capture configuration
   ECHO_CANCELLATION: false,
-  NOISE_SUPPRESSION: false, // Lo hace nuestra IA
+  NOISE_SUPPRESSION: false, // Our AI handles this
   AUTO_GAIN_CONTROL: false,
 };
 

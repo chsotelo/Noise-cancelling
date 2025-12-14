@@ -11,7 +11,6 @@ import init, {
 import {
   AudioResampler,
   AudioDynamicProcessor,
-  CircularBuffer,
 } from "../../src/utils/audioResampler.js";
 
 // Variable global para el WASM inicializado
@@ -27,12 +26,12 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
     this.dfState = null;
     this.frameLength = 0;
 
-    // Input buffer for accumulating samples (circular buffer to avoid splice)
-    this.inputBuffer = new CircularBuffer(2048); // 2048 = ~42ms buffer @ 48kHz
+    // Input buffer for accumulating samples
+    this.inputBuffer = [];
 
     // High-quality resampler (48kHz -> 24kHz with anti-aliasing)
     this.resampler = new AudioResampler();
-    this.downsampleBuffer = new CircularBuffer(4096); // 4096 = ~85ms buffer @ 48kHz
+    this.downsampleBuffer = [];
 
     // Dynamic audio processor (adaptive gain + soft limiter)
     this.dynamicProcessor = new AudioDynamicProcessor();
@@ -70,6 +69,9 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
         this.isRecordingActive = false;
       } else if (event.data === "flush") {
         this.flushBuffers();
+      } else if (event.data?.type === "cleanup") {
+        console.log("[DeepFilterNet] Cleanup requested");
+        this.cleanup();
       }
     };
 
@@ -101,10 +103,10 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
       // Cargar modelo desde main thread o usar modelo embebido
       // Attenuation limit in dB: higher values = more aggressive noise suppression
       // CRITICAL: Too high removes soft speech, too low doesn't clean noise
-      // Sweet spot: 30-35dB for non-stationary noise (keyboards, clicks, background)
-      // Values: 28dB = gentle, 30dB = balanced, 32dB = moderate-aggressive, 35dB = aggressive
-      // OPTIMIZED: 30dB for balanced noise suppression with maximum voice clarity
-      const attenLim = 30; // Balanced cleaning
+      // Sweet spot: 25-30dB for mixed scenarios (clean audio + noisy audio)
+      // Values: 25dB = gentle, 27dB = light, 30dB = balanced, 32dB = moderate-aggressive
+      // OPTIMIZED: 27dB for preserving clean voice while still removing noise
+      const attenLim = 27; // Gentle cleaning - preserves clean audio better
 
       // DeepFilterNet WASM analysis:
       // - Compiled with "default-model" feature (has embedded model)
@@ -137,9 +139,9 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
       this.dfState = df_create(modelArray, attenLim);
 
       // CRITICAL: Enable post-filter for non-stationary noise (keyboard, clicks, transient sounds)
-      // Beta range: 0.04 = gentle, 0.06 = light, 0.08 = moderate, 0.10 = strong
-      // OPTIMIZED: 0.06 for clean noise removal without affecting voice clarity
-      const postFilterBeta = 0.06;
+      // Beta range: 0.02 = very gentle, 0.04 = gentle, 0.06 = light, 0.08 = moderate
+      // OPTIMIZED: 0.04 for gentle noise removal that preserves clean audio
+      const postFilterBeta = 0.01;
       df_set_post_filter_beta(this.dfState, postFilterBeta);
 
       this.frameLength = df_get_frame_length(this.dfState);
@@ -197,8 +199,9 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
 
     // Process complete frames
     while (this.inputBuffer.length >= this.frameLength) {
-      // Extract frame (zero-copy with circular buffer)
-      const frame = this.inputBuffer.read(this.frameLength);
+      // Extract frame
+      const frameArray = this.inputBuffer.splice(0, this.frameLength);
+      const frame = new Float32Array(frameArray);
 
       // Input validation removed for cleaner logs
 
@@ -243,8 +246,14 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
       // Calculate how many complete chunks we can create (even number for proper decimation)
       const samplesToProcess = Math.floor(this.downsampleBuffer.length / 2) * 2;
 
-      // Extract samples to process (zero-copy read)
-      const input48k = this.downsampleBuffer.read(samplesToProcess);
+      // Extract samples to process
+      const input48k = new Float32Array(samplesToProcess);
+      for (let i = 0; i < samplesToProcess; i++) {
+        input48k[i] = this.downsampleBuffer[i];
+      }
+
+      // Remove processed samples, keep remainder for next iteration
+      this.downsampleBuffer.splice(0, samplesToProcess);
 
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
       // STEP 1: High-quality resampling with anti-aliasing FIR filter
@@ -298,7 +307,8 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
     // to avoid adding artificial silence
     if (this.inputBuffer.length >= this.frameLength) {
       // Process final complete frame
-      const frame = this.inputBuffer.read(this.frameLength);
+      const frameArray = this.inputBuffer.splice(0, this.frameLength);
+      const frame = new Float32Array(frameArray);
 
       try {
         const processedFrame = df_process_frame(this.dfState, frame);
@@ -310,7 +320,7 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
       }
     } else if (this.inputBuffer.length > 0) {
       // Clear incomplete frame to avoid artificial duration extension
-      this.inputBuffer.clear();
+      this.inputBuffer = [];
     }
 
     // Process remaining samples in downsampleBuffer
@@ -319,7 +329,11 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
       const samplesToProcess = Math.floor(this.downsampleBuffer.length / 2) * 2;
 
       if (samplesToProcess >= 2) {
-        const input48k = this.downsampleBuffer.read(samplesToProcess);
+        const input48k = new Float32Array(samplesToProcess);
+        for (let i = 0; i < samplesToProcess; i++) {
+          input48k[i] = this.downsampleBuffer[i];
+        }
+        this.downsampleBuffer.splice(0, samplesToProcess);
 
         const resampled24k = this.resampler.resample48to24(input48k);
         const { processed } = this.dynamicProcessor.process(resampled24k);
@@ -339,6 +353,29 @@ class DeepFilterProcessor extends AudioWorkletProcessor {
         );
       }
     }
+  }
+
+  cleanup() {
+    console.log("[DeepFilterNet] Cleaning up resources...");
+
+    // Clean DeepFilterNet state
+    if (this.df && dfWasm) {
+      try {
+        dfWasm.df_free(this.df);
+        console.log("[DeepFilterNet] ✅ DF state freed");
+      } catch (e) {
+        console.warn("[DeepFilterNet] Error freeing DF state:", e);
+      }
+      this.df = null;
+    }
+
+    // Clear buffers
+    this.inputBuffer = [];
+    this.downsampleBuffer = [];
+    this.outputBuffer = [];
+
+    this.initialized = false;
+    console.log("[DeepFilterNet] ✅ Cleanup complete");
   }
 }
 

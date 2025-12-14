@@ -60,8 +60,12 @@ class LocalAudioService {
       this.#status === AudioServiceStatus.CAPTURING ||
       this.#status === AudioServiceStatus.INITIALIZING
     ) {
-      return;
+      console.log(
+        "[AudioService] Already starting/started, returning existing stream"
+      );
+      return this.stream;
     }
+
     this.#setState(AudioServiceStatus.INITIALIZING);
     this.onProcessedDataCallback = onProcessedData;
 
@@ -302,7 +306,8 @@ class LocalAudioService {
     this.#destroyStream();
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        deviceId: deviceId === "default" ? undefined : { exact: deviceId },
+        // Safari-compatible: use string directly instead of { exact: deviceId }
+        deviceId: deviceId === "default" ? undefined : deviceId,
 
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         // Disable all browser processing - we handle everything in worklets
@@ -340,6 +345,7 @@ class LocalAudioService {
 
       // Reutilizar el contexto pre-inicializado si está disponible
       if (this.preInitContext && this.preInitContext.state !== "closed") {
+        console.log(`[${this.currentMode}] Reusing pre-initialized context`);
         this.audioContext = this.preInitContext;
         this.workletNode = this.preInitWorklet;
 
@@ -364,6 +370,104 @@ class LocalAudioService {
         // Asegurarse de que el worklet esté listo
         if (!this.dtlnInitialized) {
           throw new Error("Model not ready, forcing re-initialization");
+        }
+      } else if (
+        this.audioContext &&
+        this.audioContext.state !== "closed" &&
+        this.audioContext.sampleRate === processingRate
+      ) {
+        // Reutilizar audioContext existente si coincide con el sample rate
+        console.log(`[${this.currentMode}] Reusing existing AudioContext`);
+
+        if (this.audioContext.state === "suspended") {
+          await this.audioContext.resume();
+        }
+
+        // Necesitamos crear un nuevo worklet node
+        const workletPath = this.getWorkletPath(this.currentMode);
+        const workletURL = new URL(
+          `${import.meta.env.BASE_URL}${workletPath}`,
+          window.location.origin
+        );
+
+        try {
+          await this.audioContext.audioWorklet.addModule(workletURL.href);
+        } catch (e) {
+          // Module might already be loaded
+          console.log("Worklet module already loaded or error:", e.message);
+        }
+
+        // Load WASM files based on current mode
+        let wasmBytes, modelBytes;
+
+        if (this.currentMode === "PREMIUM") {
+          [wasmBytes, modelBytes] = await Promise.all([
+            WasmLoader.loadDeepFilterNetWasm(),
+            WasmLoader.loadDeepFilterNetModel(),
+          ]);
+        } else {
+          wasmBytes = await WasmLoader.loadRNNoiseWasm();
+        }
+
+        const processorName = this.getProcessorName(this.currentMode);
+        this.workletNode = new AudioWorkletNode(
+          this.audioContext,
+          processorName,
+          {
+            processorOptions: {
+              disableMetrics: true,
+              mode: this.currentMode,
+              wasmBytes,
+              modelBytes,
+            },
+          }
+        );
+
+        // Store current mode on worklet for reuse checks
+        this.workletNode._currentMode = this.currentMode;
+
+        // Wait for ready message
+        const modelReady = await Promise.race([
+          new Promise((resolve, reject) => {
+            const readyHandler = (event) => {
+              console.log(`[${this.currentMode}] Worklet message:`, event.data);
+              if (event.data === "ready") {
+                console.log(`[${this.currentMode}] ✅ Model ready`);
+                this.workletNode.port.removeEventListener(
+                  "message",
+                  readyHandler
+                );
+                resolve(true);
+              } else if (event.data?.type === "error") {
+                console.error(
+                  `[${this.currentMode}] ❌ Initialization error:`,
+                  event.data.message
+                );
+                this.workletNode.port.removeEventListener(
+                  "message",
+                  readyHandler
+                );
+                reject(new Error(event.data.message));
+              }
+            };
+            this.workletNode.port.addEventListener("message", readyHandler);
+            this.workletNode.port.start();
+          }),
+          new Promise((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `${this.currentMode} model initialization timeout (15s)`
+                  )
+                ),
+              15000
+            )
+          ),
+        ]);
+
+        if (!modelReady) {
+          throw new Error(`${this.currentMode} model failed to initialize`);
         }
       } else {
         // Crear nuevo contexto a la tasa del modo actual
@@ -413,18 +517,40 @@ class LocalAudioService {
 
         // Wait for model to be ready with timeout
         const modelReady = await Promise.race([
-          new Promise((resolve) => {
-            this.workletNode.port.onmessage = (event) => {
-              if (event.data === "ready") resolve(true);
+          new Promise((resolve, reject) => {
+            const readyHandler = (event) => {
+              console.log(`[${this.currentMode}] Worklet message:`, event.data);
+              if (event.data === "ready") {
+                console.log(`[${this.currentMode}] ✅ Model ready`);
+                this.workletNode.port.removeEventListener(
+                  "message",
+                  readyHandler
+                );
+                resolve(true);
+              } else if (event.data?.type === "error") {
+                console.error(
+                  `[${this.currentMode}] ❌ Initialization error:`,
+                  event.data.message
+                );
+                this.workletNode.port.removeEventListener(
+                  "message",
+                  readyHandler
+                );
+                reject(new Error(event.data.message));
+              }
             };
+            this.workletNode.port.addEventListener("message", readyHandler);
+            this.workletNode.port.start(); // Ensure port is started
           }),
           new Promise((_, reject) =>
             setTimeout(
               () =>
                 reject(
-                  new Error(`${this.currentMode} model initialization timeout`)
+                  new Error(
+                    `${this.currentMode} model initialization timeout (10s)`
+                  )
                 ),
-              10000
+              15000 // Increased timeout to 15s for WASM initialization
             )
           ),
         ]);
@@ -432,6 +558,19 @@ class LocalAudioService {
         if (!modelReady) {
           throw new Error(`${this.currentMode} model failed to initialize`);
         }
+      }
+
+      // Verify audioContext and workletNode are valid before continuing
+      if (!this.audioContext || this.audioContext.state === "closed") {
+        throw new Error("AudioContext is not available or was closed");
+      }
+
+      if (!this.workletNode) {
+        throw new Error("WorkletNode was not created");
+      }
+
+      if (!this.stream) {
+        throw new Error("MediaStream is not available");
       }
 
       this.microphoneSource = this.audioContext.createMediaStreamSource(
@@ -444,6 +583,10 @@ class LocalAudioService {
         this.microphoneSource.connect(this.workletNode);
         // No conectar a destination - solo procesamos, no reproducimos
       } catch (connectionError) {
+        console.error(
+          "[AudioService] Connection error details:",
+          connectionError
+        );
         throw new Error("Audio processing pipeline connection failed");
       }
 
@@ -468,11 +611,11 @@ class LocalAudioService {
         }
       };
 
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // PASO FINAL: Iniciar monitoreo de rendimiento
-      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-      this.#startRuntimeMonitoring();
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // PASO FINAL: Iniciar monitoreo de rendimiento (DISABLED)
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // Runtime monitoring disabled - causes CPU overhead itself
+      // this.#startRuntimeMonitoring();
     } catch (error) {
       console.error("Audio processing setup failed:", error);
       this.#status = AudioServiceStatus.ERROR;
@@ -489,16 +632,27 @@ class LocalAudioService {
       clearInterval(this.runtimeMonitorId);
     }
 
+    let upgradeLogged = false;
+    let downgradeLogged = false;
+
     this.runtimeMonitorId = DeviceCapabilityDetector.monitorRuntime(
       (action) => {
         if (action === "DOWNGRADE" && this.currentMode === "PREMIUM") {
-          console.warn("⚠️ CPU overload detected, switching to LIGHT mode");
-          this.#setToast("Switching to Light mode due to high CPU usage");
+          if (!downgradeLogged) {
+            console.warn("⚠️ CPU overload detected, switching to LIGHT mode");
+            this.#setToast("Switching to Light mode due to high CPU usage");
+            downgradeLogged = true;
+            upgradeLogged = false;
+          }
           // TODO: Implementar hot-swap de modo sin reiniciar
           // Por ahora solo alertamos
         } else if (action === "UPGRADE" && this.currentMode === "LIGHT") {
-          console.log("✅ CPU available, can upgrade to PREMIUM mode");
-          this.#setToast("Device can handle Premium mode");
+          if (!upgradeLogged) {
+            console.log("✅ CPU available, can upgrade to PREMIUM mode");
+            this.#setToast("Device can handle Premium mode");
+            upgradeLogged = true;
+            downgradeLogged = false;
+          }
         }
       }
     );
@@ -578,8 +732,12 @@ class LocalAudioService {
       this.microphoneSource.disconnect();
       this.microphoneSource = null;
     }
-    // Solo cerrar si no estamos reutilizando el contexto
-    if (this.audioContext && this.audioContext.state !== "closed") {
+    // Close audio context only if it's NOT the pre-init context
+    if (
+      this.audioContext &&
+      this.audioContext.state !== "closed" &&
+      this.audioContext !== this.preInitContext
+    ) {
       this.audioContext.close();
     }
     this.audioContext = null;
@@ -620,6 +778,81 @@ class LocalAudioService {
       "devicechange",
       this.handleDeviceChange
     );
+  }
+
+  /**
+   * Full reset - cleanup everything and return to initial state
+   * Used when ending conversation and returning to setup screen
+   */
+  fullReset() {
+    console.log("[AudioService] Full reset initiated");
+
+    // Stop any active processing
+    if (this.workletNode) {
+      try {
+        this.workletNode.port.postMessage({ type: "cleanup" });
+        this.workletNode.port.postMessage("stop");
+        this.workletNode.port.postMessage("flush");
+        this.workletNode.port.close();
+        this.workletNode.disconnect();
+      } catch (e) {
+        console.warn("Error cleaning worklet:", e);
+      }
+      this.workletNode = null;
+    }
+
+    // Disconnect audio source
+    if (this.microphoneSource) {
+      try {
+        this.microphoneSource.disconnect();
+      } catch (e) {
+        console.warn("Error disconnecting mic source:", e);
+      }
+      this.microphoneSource = null;
+    }
+
+    // Stop and cleanup stream
+    if (this.stream) {
+      this.stream.getTracks().forEach((track) => {
+        track.stop();
+      });
+      this.stream = null;
+    }
+
+    // Clear callbacks
+    this.onProcessedDataCallback = null;
+
+    // IMPORTANT: Do NOT destroy audioContext - keep it for reuse
+    // Just disconnect nodes but preserve the context
+
+    // Clear mode state
+    this.currentMode = null;
+    this.currentModeConfig = null;
+
+    // Stop monitoring
+    if (this.runtimeMonitorId) {
+      clearInterval(this.runtimeMonitorId);
+      this.runtimeMonitorId = null;
+    }
+
+    // Stop pre-init resources
+    if (this.preInitSilentSource) {
+      try {
+        this.preInitSilentSource.stop();
+        this.preInitSilentSource.disconnect();
+      } catch (e) {
+        // Already stopped
+      }
+      this.preInitSilentSource = null;
+    }
+
+    // Reset dtln flag so it can be re-initialized
+    this.dtlnInitialized = false;
+
+    // Reset to idle state
+    this.#setState(AudioServiceStatus.IDLE);
+
+    console.log("[AudioService] Full reset complete - ready for new session");
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

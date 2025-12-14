@@ -185,6 +185,8 @@ export class DeviceCapabilityDetector {
   static monitorRuntime(callback) {
     const cpuSamples = [];
     const maxSamples = 10;
+    let lastAction = null; // Track last action to avoid spam
+    let logCounter = 0; // Log only every N checks
 
     const intervalId = setInterval(() => {
       // Medir timing indirecto de CPU vía requestAnimationFrame
@@ -207,13 +209,33 @@ export class DeviceCapabilityDetector {
           // 50ms = 20 FPS (muy malo), 100 varianza = frames muy inestables
           // Alta varianza + frameTime alto = CPU sobrecargada
           if (avgFrameTime > 50 && variance > 100) {
-            console.warn("⚠️ High CPU load detected, suggesting DOWNGRADE");
-            callback("DOWNGRADE");
+            if (lastAction !== "DOWNGRADE") {
+              console.warn("⚠️ High CPU load detected, suggesting DOWNGRADE");
+              lastAction = "DOWNGRADE";
+              callback("DOWNGRADE");
+            }
           }
           // Baja varianza + frameTime bajo = CPU disponible
           else if (avgFrameTime < 10 && variance < 20) {
-            console.log("✅ Low CPU load, safe to UPGRADE");
-            callback("UPGRADE");
+            // Only log and callback if state changed or every 10th check
+            if (lastAction !== "UPGRADE") {
+              console.log("✅ Low CPU load, safe to UPGRADE");
+              lastAction = "UPGRADE";
+              callback("UPGRADE");
+            } else {
+              // Silent check - CPU still good but don't spam
+              logCounter++;
+              if (logCounter >= 10) {
+                console.log("🔍 CPU performance stable (good)");
+                logCounter = 0;
+              }
+            }
+          } else {
+            // Normal load - reset state
+            if (lastAction !== null) {
+              console.log("🔵 CPU load normal");
+              lastAction = null;
+            }
           }
         }
       });

@@ -738,6 +738,9 @@ var RNNoiseLightProcessor = class extends AudioWorkletProcessor {
         this.isRecordingActive = false;
       } else if (event.data === "flush") {
         this.flushBuffers();
+      } else if (event.data?.type === "cleanup") {
+        console.log("[RNNoise LIGHT] Cleanup requested");
+        this.cleanup();
       }
     };
     this.initRNNoise();
@@ -899,6 +902,36 @@ var RNNoiseLightProcessor = class extends AudioWorkletProcessor {
       console.error("[RNNoise LIGHT] Frame processing error:", error);
       this.outputBuffer.set(this.inputBuffer);
     }
+  }
+  cleanup() {
+    console.log("[RNNoise LIGHT] Cleaning up resources...");
+    if (this.rnnoiseState && rnnoiseWasmModule) {
+      try {
+        rnnoiseWasmModule._rnnoise_destroy(this.rnnoiseState);
+        console.log("[RNNoise LIGHT] \u2705 RNNoise state destroyed");
+      } catch (e) {
+        console.warn("[RNNoise LIGHT] Error destroying state:", e);
+      }
+      this.rnnoiseState = null;
+    }
+    if (this.heapInputBuffer && rnnoiseWasmModule) {
+      try {
+        rnnoiseWasmModule._free(this.heapInputBuffer);
+      } catch (e) {
+        console.warn("[RNNoise LIGHT] Error freeing input buffer:", e);
+      }
+      this.heapInputBuffer = null;
+    }
+    if (this.heapOutputBuffer && rnnoiseWasmModule) {
+      try {
+        rnnoiseWasmModule._free(this.heapOutputBuffer);
+      } catch (e) {
+        console.warn("[RNNoise LIGHT] Error freeing output buffer:", e);
+      }
+      this.heapOutputBuffer = null;
+    }
+    this.initialized = false;
+    console.log("[RNNoise LIGHT] \u2705 Cleanup complete");
   }
   flushBuffers() {
     console.log("[RNNoise LIGHT] Flushing remaining buffers before stop...");

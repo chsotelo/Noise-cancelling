@@ -494,79 +494,6 @@ var AudioDynamicProcessor = class {
     };
   }
 };
-var CircularBuffer = class {
-  constructor(capacity) {
-    this.capacity = capacity;
-    this.buffer = new Float32Array(capacity);
-    this.writePos = 0;
-    this.readPos = 0;
-    this.available = 0;
-  }
-  /**
-   * Push a single sample into the buffer
-   */
-  push(sample) {
-    this.buffer[this.writePos] = sample;
-    this.writePos = (this.writePos + 1) % this.capacity;
-    if (this.available < this.capacity) {
-      this.available++;
-    } else {
-      this.readPos = (this.readPos + 1) % this.capacity;
-    }
-  }
-  /**
-   * Get number of samples available to read
-   */
-  get length() {
-    return this.available;
-  }
-  /**
-   * Read N samples into a new Float32Array (non-destructive peek)
-   * Use this when you need to pass data to WASM or other APIs
-   */
-  peek(count) {
-    if (count > this.available) {
-      throw new Error(
-        `Cannot peek ${count} samples, only ${this.available} available`
-      );
-    }
-    const result = new Float32Array(count);
-    let readIdx = this.readPos;
-    for (let i = 0; i < count; i++) {
-      result[i] = this.buffer[readIdx];
-      readIdx = (readIdx + 1) % this.capacity;
-    }
-    return result;
-  }
-  /**
-   * Consume N samples (advance read position)
-   */
-  consume(count) {
-    if (count > this.available) {
-      throw new Error(
-        `Cannot consume ${count} samples, only ${this.available} available`
-      );
-    }
-    this.readPos = (this.readPos + count) % this.capacity;
-    this.available -= count;
-  }
-  /**
-   * Read and consume N samples in one operation
-   */
-  read(count) {
-    const data = this.peek(count);
-    this.consume(count);
-    return data;
-  }
-  /**
-   * Clear the buffer
-   */
-  clear() {
-    this.readPos = 0;
-    this.writePos = 0;
-    this.available = 0;
-  }
-};
 
 // src/worklets/deepfilter-worklet.source.js
 var wasmInitialized = false;
@@ -578,9 +505,9 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
     this.initialized = false;
     this.dfState = null;
     this.frameLength = 0;
-    this.inputBuffer = new CircularBuffer(2048);
+    this.inputBuffer = [];
     this.resampler = new AudioResampler();
-    this.downsampleBuffer = new CircularBuffer(4096);
+    this.downsampleBuffer = [];
     this.dynamicProcessor = new AudioDynamicProcessor();
     this.processedFrameCount = 0;
     this.FADEIN_FRAMES = 1;
@@ -605,6 +532,9 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
         this.isRecordingActive = false;
       } else if (event.data === "flush") {
         this.flushBuffers();
+      } else if (event.data?.type === "cleanup") {
+        console.log("[DeepFilterNet] Cleanup requested");
+        this.cleanup();
       }
     };
     this.initializeWasm();
@@ -622,7 +552,7 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
       } else if (wasmInitPromise) {
         await wasmInitPromise;
       }
-      const attenLim = 30;
+      const attenLim = 27;
       if (!this.modelBytes || this.modelBytes.byteLength < 100) {
         throw new Error(
           "DeepFilterNet requires valid model tar.gz - none provided"
@@ -636,7 +566,7 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
         );
       }
       this.dfState = df_create(modelArray, attenLim);
-      const postFilterBeta = 0.06;
+      const postFilterBeta = 0.01;
       df_set_post_filter_beta(this.dfState, postFilterBeta);
       this.frameLength = df_get_frame_length(this.dfState);
       this.initialized = true;
@@ -671,7 +601,8 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
       this.inputBuffer.push(inputChannel[i]);
     }
     while (this.inputBuffer.length >= this.frameLength) {
-      const frame = this.inputBuffer.read(this.frameLength);
+      const frameArray = this.inputBuffer.splice(0, this.frameLength);
+      const frame = new Float32Array(frameArray);
       try {
         const processedFrame = df_process_frame(this.dfState, frame);
         this.processedFrameCount++;
@@ -695,7 +626,11 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
     const MIN_CHUNK_SIZE_48KHZ = MIN_CHUNK_SIZE_24KHZ * 2;
     if (this.downsampleBuffer.length >= MIN_CHUNK_SIZE_48KHZ) {
       const samplesToProcess = Math.floor(this.downsampleBuffer.length / 2) * 2;
-      const input48k = this.downsampleBuffer.read(samplesToProcess);
+      const input48k = new Float32Array(samplesToProcess);
+      for (let i = 0; i < samplesToProcess; i++) {
+        input48k[i] = this.downsampleBuffer[i];
+      }
+      this.downsampleBuffer.splice(0, samplesToProcess);
       const resampled24k = this.resampler.resample48to24(input48k);
       const { processed, gainApplied, rms, peak, saturated } = this.dynamicProcessor.process(resampled24k);
       const pcm16 = new Int16Array(processed.length);
@@ -723,7 +658,8 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
       return;
     }
     if (this.inputBuffer.length >= this.frameLength) {
-      const frame = this.inputBuffer.read(this.frameLength);
+      const frameArray = this.inputBuffer.splice(0, this.frameLength);
+      const frame = new Float32Array(frameArray);
       try {
         const processedFrame = df_process_frame(this.dfState, frame);
         for (let j = 0; j < processedFrame.length; j++) {
@@ -732,12 +668,16 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
       } catch (error) {
       }
     } else if (this.inputBuffer.length > 0) {
-      this.inputBuffer.clear();
+      this.inputBuffer = [];
     }
     if (this.downsampleBuffer.length > 0) {
       const samplesToProcess = Math.floor(this.downsampleBuffer.length / 2) * 2;
       if (samplesToProcess >= 2) {
-        const input48k = this.downsampleBuffer.read(samplesToProcess);
+        const input48k = new Float32Array(samplesToProcess);
+        for (let i = 0; i < samplesToProcess; i++) {
+          input48k[i] = this.downsampleBuffer[i];
+        }
+        this.downsampleBuffer.splice(0, samplesToProcess);
         const resampled24k = this.resampler.resample48to24(input48k);
         const { processed } = this.dynamicProcessor.process(resampled24k);
         const pcm16 = new Int16Array(processed.length);
@@ -754,6 +694,23 @@ var DeepFilterProcessor = class extends AudioWorkletProcessor {
         );
       }
     }
+  }
+  cleanup() {
+    console.log("[DeepFilterNet] Cleaning up resources...");
+    if (this.df && dfWasm) {
+      try {
+        dfWasm.df_free(this.df);
+        console.log("[DeepFilterNet] \u2705 DF state freed");
+      } catch (e) {
+        console.warn("[DeepFilterNet] Error freeing DF state:", e);
+      }
+      this.df = null;
+    }
+    this.inputBuffer = [];
+    this.downsampleBuffer = [];
+    this.outputBuffer = [];
+    this.initialized = false;
+    console.log("[DeepFilterNet] \u2705 Cleanup complete");
   }
 };
 registerProcessor("deepfilter-processor", DeepFilterProcessor);

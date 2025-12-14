@@ -58,6 +58,25 @@ export class WasmLoader {
     try {
       console.log("[WASM Loader] Loading DeepFilterNet model...");
 
+      // First, try to load from IndexedDB
+      const { modelStorage } = await import("../services/modelStorage.js");
+
+      const isAvailable = await modelStorage.isModelAvailable();
+
+      if (isAvailable) {
+        console.log("[WASM Loader] ✅ Loading model from IndexedDB cache");
+        const modelBytes = await modelStorage.loadModel();
+        console.log(
+          "[WASM Loader] ✅ Model loaded from cache:",
+          (modelBytes.byteLength / 1024 / 1024).toFixed(2),
+          "MB"
+        );
+        return modelBytes;
+      }
+
+      // Fallback: Load from network (this should rarely happen with new flow)
+      console.log("[WASM Loader] Model not in cache, loading from network...");
+
       // Use .bin extension to prevent Vite from auto-decompressing the .gz file
       const modelUrl =
         "/Noise-cancelling/24khz/models/DeepFilterNet3_onnx.tar.gz.bin";
@@ -70,10 +89,19 @@ export class WasmLoader {
       const modelBytes = await response.arrayBuffer();
 
       console.log(
-        "[WASM Loader] ✅ DeepFilterNet model loaded:",
+        "[WASM Loader] ✅ DeepFilterNet model loaded from network:",
         (modelBytes.byteLength / 1024 / 1024).toFixed(2),
         "MB"
       );
+
+      // Save to cache for future use
+      try {
+        await modelStorage.saveModel(modelBytes);
+        console.log("[WASM Loader] Model saved to IndexedDB cache");
+      } catch (cacheError) {
+        console.warn("[WASM Loader] Failed to cache model:", cacheError);
+        // Continue anyway - we have the model in memory
+      }
 
       return modelBytes;
     } catch (error) {
