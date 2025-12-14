@@ -4,7 +4,7 @@ import react from "@vitejs/plugin-react";
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
-  base: "/Noise-cancelling/24khz/",
+  base: "/Noise-cancelling/",
   server: {
     // Necesario para que SharedArrayBuffer (usado por WASM) funcione en dev
     headers: {
