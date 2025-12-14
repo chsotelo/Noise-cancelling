@@ -29,11 +29,11 @@ jobs:
           node-version: "20"
 
       - name: Install dependencies
-        working-directory: ./clear_audio_test
+        working-directory: ./clear_audio_test_24khz
         run: npm install
 
       - name: Build
-        working-directory: ./clear_audio_test
+        working-directory: ./clear_audio_test_24khz
         run: npm run build
 
       - name: Setup Pages
@@ -42,7 +42,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: "./clear_audio_test/dist"
+          path: "./clear_audio_test_24khz/dist"
 
   deploy:
     environment:
