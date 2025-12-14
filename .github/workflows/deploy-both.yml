@@ -1,10 +1,6 @@
-name: Deploy Both Audio Tests to GitHub Pages
+name: Deploy Both Audio Tests to GitHub Pages (DISABLED)
 
 on:
-  push:
-    branches:
-      - main
-      - master
   workflow_dispatch:
 
 permissions:
