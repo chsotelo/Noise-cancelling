@@ -6,7 +6,7 @@ export class WasmLoader {
     try {
       console.log("[WASM Loader] Loading DeepFilterNet WASM...");
 
-      const wasmUrl = "/Noise-cancelling/24khz/_worklets/df_bg.wasm";
+      const wasmUrl = "/Noise-cancelling/_worklets/df_bg.wasm";
       const response = await fetch(wasmUrl);
 
       if (!response.ok) {
@@ -32,7 +32,7 @@ export class WasmLoader {
     try {
       console.log("[WASM Loader] Loading RNNoise WASM...");
 
-      const wasmUrl = "/Noise-cancelling/24khz/_worklets/rnnoise.wasm";
+      const wasmUrl = "/Noise-cancelling/_worklets/rnnoise.wasm";
       const response = await fetch(wasmUrl);
 
       if (!response.ok) {
@@ -79,7 +79,7 @@ export class WasmLoader {
 
       // Use .bin extension to prevent Vite from auto-decompressing the .gz file
       const modelUrl =
-        "/Noise-cancelling/24khz/models/DeepFilterNet3_onnx.tar.gz.bin";
+        "/Noise-cancelling/models/DeepFilterNet3_onnx.tar.gz.bin";
       const response = await fetch(modelUrl);
 
       if (!response.ok) {
