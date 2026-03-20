@@ -54,7 +54,7 @@ export default function ConversationScreen({ config, onEndConversation }) {
         localAudioService.getCurrentMode() === config.mode
       ) {
         console.log(
-          "[ConversationScreen] Audio service already initialized, skipping"
+          "[ConversationScreen] Audio service already initialized, skipping",
         );
         setIsInitializing(false);
         return;
@@ -68,7 +68,7 @@ export default function ConversationScreen({ config, onEndConversation }) {
       // Start audio service with selected mode
       const originalStream = await localAudioService.start(
         handleProcessedData,
-        config.mode
+        config.mode,
       );
 
       // Pre-load worklet but don't start recording yet
@@ -85,7 +85,7 @@ export default function ConversationScreen({ config, onEndConversation }) {
     // Prevent double initialization in React StrictMode
     if (isInitializingRef.current) {
       console.log(
-        "[ConversationScreen] Already initializing, skipping duplicate call"
+        "[ConversationScreen] Already initializing, skipping duplicate call",
       );
       return;
     }
@@ -106,7 +106,14 @@ export default function ConversationScreen({ config, onEndConversation }) {
 
     // Generate original audio
     if (originalAudioChunksRef.current.length > 0) {
-      const originalBlob = new Blob(originalAudioChunksRef.current);
+      // Safari requires explicit mimeType on Blob to play audio
+      const blobType =
+        mediaRecorderRef.current?.mimeType ||
+        originalAudioChunksRef.current[0]?.type ||
+        "audio/webm";
+      const originalBlob = new Blob(originalAudioChunksRef.current, {
+        type: blobType,
+      });
       const originalUrl = URL.createObjectURL(originalBlob);
       setOriginalAudioUrl(originalUrl);
 
@@ -130,7 +137,7 @@ export default function ConversationScreen({ config, onEndConversation }) {
       const processedBlob = encodeWAV(
         allChunks,
         AUDIO_CAPTURE_CONFIG.TRANSMISSION_SAMPLE_RATE,
-        AUDIO_CAPTURE_CONFIG.CHANNELS
+        AUDIO_CAPTURE_CONFIG.CHANNELS,
       );
 
       const processedUrl = URL.createObjectURL(processedBlob);
@@ -141,8 +148,8 @@ export default function ConversationScreen({ config, onEndConversation }) {
         totalSamples / AUDIO_CAPTURE_CONFIG.TRANSMISSION_SAMPLE_RATE;
       console.log(
         `[Audio Stats] Recording time: ${recordingDuration.toFixed(
-          2
-        )}s | Processed samples duration: ${actualDuration.toFixed(2)}s`
+          2,
+        )}s | Processed samples duration: ${actualDuration.toFixed(2)}s`,
       );
 
       setAudioStats((prev) => ({
@@ -187,7 +194,16 @@ export default function ConversationScreen({ config, onEndConversation }) {
       }
 
       // Setup MediaRecorder for original audio
-      const recorder = new MediaRecorder(originalStream);
+      // Safari doesn't support audio/webm - detect best supported format
+      const mimeType = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4",
+        "audio/ogg;codecs=opus",
+      ].find((type) => MediaRecorder.isTypeSupported(type));
+
+      const recorderOptions = mimeType ? { mimeType } : {};
+      const recorder = new MediaRecorder(originalStream, recorderOptions);
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (event) => {
@@ -203,9 +219,9 @@ export default function ConversationScreen({ config, onEndConversation }) {
       // Start worklet processing
       localAudioService.workletNode?.port.postMessage("start");
 
-      // Start MediaRecorder
+      // Start MediaRecorder with timeslice for Safari compatibility
       recordingStartTimeRef.current = Date.now();
-      recorder.start();
+      recorder.start(250);
 
       setIsRecording(true);
     } catch (err) {
