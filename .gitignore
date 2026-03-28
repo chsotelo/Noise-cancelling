@@ -38,7 +38,4 @@ Cargo.lock
 coverage/
 .nyc_output/
 
-DeepFilterNet/
 .deepfilternet_cache/
-dtln-rs-demo/
-rnnoise-wasm/

@@ -47,13 +47,15 @@ function addHeapObject(obj) {
     return idx;
 }
 /**
-* Get DeepFilterNet frame size in samples.
+* Set DeepFilterNet post filter beta. A beta of 0 disables the post filter.
+*
+* Args:
+*     - beta: Post filter attenuation. Suitable range between 0.05 and 0;
 * @param {number} st
-* @returns {number}
+* @param {number} beta
 */
-export function df_get_frame_length(st) {
-    const ret = wasm.df_get_frame_length(st);
-    return ret >>> 0;
+export function df_set_post_filter_beta(st, beta) {
+    wasm.df_set_post_filter_beta(st, beta);
 }
 
 let cachedFloat32Memory0 = null;
@@ -95,27 +97,13 @@ export function df_process_frame(st, input) {
 }
 
 /**
-* Set DeepFilterNet post filter beta. A beta of 0 disables the post filter.
-*
-* Args:
-*     - beta: Post filter attenuation. Suitable range between 0.05 and 0;
+* Get DeepFilterNet frame size in samples.
 * @param {number} st
-* @param {number} beta
+* @returns {number}
 */
-export function df_set_post_filter_beta(st, beta) {
-    wasm.df_set_post_filter_beta(st, beta);
-}
-
-/**
-* Set DeepFilterNet attenuation limit.
-*
-* Args:
-*     - lim_db: New attenuation limit in dB.
-* @param {number} st
-* @param {number} lim_db
-*/
-export function df_set_atten_lim(st, lim_db) {
-    wasm.df_set_atten_lim(st, lim_db);
+export function df_get_frame_length(st) {
+    const ret = wasm.df_get_frame_length(st);
+    return ret >>> 0;
 }
 
 function passArray8ToWasm0(arg, malloc) {
@@ -142,6 +130,18 @@ export function df_create(model_bytes, atten_lim) {
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.df_create(ptr0, len0, atten_lim);
     return ret >>> 0;
+}
+
+/**
+* Set DeepFilterNet attenuation limit.
+*
+* Args:
+*     - lim_db: New attenuation limit in dB.
+* @param {number} st
+* @param {number} lim_db
+*/
+export function df_set_atten_lim(st, lim_db) {
+    wasm.df_set_atten_lim(st, lim_db);
 }
 
 function handleError(f, args) {
